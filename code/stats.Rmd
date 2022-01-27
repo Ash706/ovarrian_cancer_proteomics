@@ -1,0 +1,995 @@
+---
+title: "Potato NGS analyses V2"
+author: "Ashfaq Ali"
+date: "12/10/2021"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      collapse = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache = FALSE, 
+                      cache.path = "../cache/", 
+                      fig.height = 5, 
+                      fig.width = 6,
+                      eval=TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+```
+
+
+
+1. Comparisons
+2. Plots
+3. Report
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+# Data packages
+
+library(annotater) # Annotate Package Load Calls
+library(tidyverse) # Easily Install and Load the 'Tidyverse' # Easily Install and Load the 'Tidyverse'
+library(stringr) # Simple, Consistent Wrappers for Common String Operations
+
+# Analyses
+library(GenomicFeatures) # create txdb from gtf files
+library(readr) # Read Rectangular Text Data
+library(DESeq2) # Differential gene expression analysis based on the negative binomial distribution
+library(biomaRt) # Interface to BioMart databases (i.e. Ensembl)
+
+# Plotting
+library(gplots) # Various R Programming Tools for Plotting Data
+library(VennDiagram) # Generate High-Resolution Venn and Euler Plots
+library(ggplot2) # Create Elegant Data Visualisations Using the Grammar of Graphics
+library(pheatmap) # Pretty Heatmaps
+
+# Reporting and styling
+library(lintr) # A 'Linter' for R Code
+library(styler) # Non-Invasive Pretty Printing of R Code
+library(DT)
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+sample_featurcounts <- read_delim("Star_feature_counts/counts.txt", "\t", escape_double = FALSE, trim_ws = TRUE, skip = 1)
+
+row_anno <- sample_featurcounts[, 1:6]
+rownames(row_anno) <- row_anno$Geneid
+quant_files <- colnames(sample_featurcounts)
+Samples <- quant_files[7:length(quant_files)]
+Samples <- str_remove(Samples, "/Aligned.sortedByCoord.out.bam") |> str_remove("/proj/snic2021-23-431/nobackup/aligned/Sample_TK-2780-")
+
+counts <- as.matrix(sample_featurcounts[, 7:length(quant_files)])
+colnames(counts) <- Samples
+rownames(counts) <- row_anno$Geneid
+
+```
+
+
+
+```{r}
+
+phenotypes <- Samples %>%
+  str_split("-", simplify = TRUE) %>%
+  as.data.frame()
+
+phenotypes <- cbind(Samples, phenotypes)
+
+colnames(phenotypes) <- c("Sample", "Cultivar", "Condition", "Replicate", "extra")
+
+phenotypes$Condition2 <- paste0(phenotypes$Cultivar, phenotypes$Condition)
+
+phenotypes$starchTable <- ifelse(phenotypes$Cultivar %in% c("Kuras", "Quadriga", "Maksim", "Saprodi"), "Starch", "Table")
+
+rownames(phenotypes) <- phenotypes$Sample
+
+# saveRDS(phenotypes, "./Results/phenotypes.rds")
+```
+
+
+```{r}
+## Row Annotations
+
+# annotations <- readr::read_delim("DM_1-3_516_R44_potato.v6.1.working_models.func_anno.txt", delim = "\t", col_names = FALSE)
+# colnames(annotations) <- c("gene_id", "description")
+# go_annotations <- readr::read_table("DM_1-3_516_R44_potato.v6.1.working_models.go.txt",  col_names = FALSE)
+# goslim_annotations <- readr::read_table("DM_1-3_516_R44_potato.v6.1.working_models.goslim.txt",  col_names = FALSE)
+# 
+# goslim_annotations_wide <- pivot_wider(goslim_annotations, id_cols = "X2", names_from = "X7", values_from = "X4") 
+# colnames(goslim_annotations_wide) <- c("gene_id", "Biological Process", "Molecular Function", "Cellular Componenet")
+# saveRDS(list(annotations, go_annotations, goslim_annotations, goslim_annotations_wide), "./Results/Data/Annotations.rds")
+# 
+# saveRDS(txi.tx, "./Results/Data/tximportData.rds")
+# saveRDS(phenotypes,"./Results/Data/phenotypes.rds" )
+# 
+# data <- txi.tx$counts %>% as.data.frame() %>% rownames_to_column(var = "gene_id") %>% right_join(annotations, {.}, by = "gene_id") %>% 
+#       right_join(goslim_annotations_wide, {.}, by = "gene_id")
+# 
+# writexl::write_xlsx(data, "./Results/data.xlsx")
+```
+
+```{r}
+
+# List marts
+marts <- biomaRt::useMart("plants_mart", host = "plants.ensembl.org")
+
+# head(biomaRt::listDatasets(marts))
+# biomaRt::listMarts(host = "plants.ensembl.org")
+
+ensembl <- biomaRt::useDataset("stuberosum_eg_gene", marts)
+#ensembl
+
+# Available_attributes <- biomaRt::listAttributes(ensembl, page = "feature_page")$description
+# head(biomaRt::keys(ensembl, keytype = "Gene stable ID"))
+# Available_attributes
+
+#write.csv(Available_attributes, "~/Documents/Projects/PotatoNGS/reults/Avaialable_annotations.csv", row.names = FALSE)
+
+values <- rownames(counts)
+
+## attributes are whatever you want tor retrieve from database
+annotations <- biomaRt::getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id", "description", "chromosome_name", "start_position", "end_position"), filters = "ensembl_transcript_id", values = values, mart = ensembl, uniqueRows = FALSE)
+annotations$gene_id <- annotations$ensembl_transcript_id
+rownames(annotations) <- annotations$ensembl_transcript_id
+
+Go_Path_Anno <- biomaRt::getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "description", "goslim_goa_accession", "goslim_goa_description"), filters = "ensembl_transcript_id", values = values, mart = ensembl)
+
+#write.csv(Go_Path_Anno, "~/Documents/Projects/PotatoNGS/reults/Resuls_annotated/Go_term_Pathway_Annotations.csv", row.names = FALSE)
+
+Go_Path_Anno <- Go_Path_Anno |> filter(goslim_goa_description %in% c("cellular_component", "molecular_function", "biological_process"))
+goslim_annotations_wide <- pivot_wider(Go_Path_Anno, id_cols = "ensembl_transcript_id", names_from = "goslim_goa_description", values_from = c("goslim_goa_accession"))
+
+colnames(goslim_annotations_wide) <- c("gene_id", "Cellular Componenet", "Biological Process", "Molecular Function")
+row_annotations = list(row_anno, Go_Path_Anno, goslim_annotations_wide)
+
+saveRDS(row_annotations, file = "./Results/row_annotations.rds")
+```
+
+
+
+```{r}
+# gtf_file <- "./DM_1-3_516_R44_potato.v6.1.hc_gene_models.gff"
+# txdb <- makeTxDbFromGFF(gtf_file, format = "gff3", organism = "Solanum tuberosum",)
+# k <- keys(txdb, keytype = "TXID"  )
+# saveRDS(txdb, "./Results/Data/txdbFromdff3.rds")
+```
+
+
+
+```{r}
+
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = phenotypes,
+                              rowData = row_anno,
+                              design = ~1+Cultivar+Condition+Cultivar:Condition)
+
+
+saveRDS(dds, "./Results/Data/DESeqData.rds")
+
+#phenotypes$time <- factor(rep(rep(c(1,3,2 ),each=3),6), ordered = TRUE, levels = c("1", "2", "3"), labels = c("t0", "")
+
+#mat1 <- model.matrix(~1+Condition+Cultivar+Condition:Cultivar, phenotypes)
+
+dds
+idx2 <- rowMeans(assays(dds)$counts) >= 10
+dds <- dds[idx2,]
+
+#nm <- assays(dds)[["avgTxLength"]]
+dds$sf <- estimateSizeFactorsForMatrix(counts(dds))
+
+# Basic barplot
+b <- ggplot(data = as.data.frame(colData(dds)), aes(x = Sample, y = sf)) +
+  geom_bar(stat="identity") + 
+    coord_flip()
+b
+```
+
+
+```{r}
+# ddsfull <- DESeq(dds, parallel = TRUE )
+# 
+# mat2 <- model.matrix(~0+Condition2, phenotypes)
+# mat3 <- model.matrix(~0+Condition+Cultivar+Condition*Cultivar, phenotypes)
+dds <- DESeq(dds, parallel = TRUE)
+res_all <- resultsNames(dds)[2:length(resultsNames(dds))]
+
+main_effects <- list()
+
+for (i in 1:length(res_all)) {
+  main_effects[[i]] <- results(dds, name = res_all[i], alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) %>%
+    right_join(annotations,
+      {
+        .
+      },
+      by = "gene_id"
+    ) %>%
+    right_join(goslim_annotations_wide,
+      {
+        .
+      },
+      by = "gene_id"
+    )
+
+  # print(mcols(results(dds, name = res_all[i],  alpha = 0.05))$description)
+}
+names(main_effects) <- res_all
+
+## Glyco Alkaloid comparisons
+
+# highRank_wound <- (Quad=1, Ast=1, King=3, Maksim=3 )
+# 
+main_effects$QuadWoundVsKingWound <- results(dds,
+  list("CultivarQuadriga.ConditionW2d", "CultivarKingEd.ConditionW2d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+main_effects$QuadWoundVsMaksimWound <- results(dds,
+  list("CultivarQuadriga.ConditionW2d", "CultivarMaksim.ConditionW2d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+# hiRankLight <- (Quad=1, Kuras=1, Maksim=3, Saprodi=3)
+
+
+main_effects$QuadLightVsMaksimLight <- results(dds,
+  list("CultivarQuadriga.ConditionL8d", "CultivarMaksim.ConditionL8d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+main_effects$QuadLightVsSaprodiLight <- results(dds,
+  list("CultivarQuadriga.ConditionL8d", "CultivarSaprodi.ConditionL8d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+main_effects$KurasLightVsMaksimLight <- results(dds,
+  list("CultivarKuras.ConditionL8d", "CultivarMaksim.ConditionL8d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+main_effects$KurasLightVsSaprodiLight <- results(dds,
+  list("CultivarKuras.ConditionL8d", "CultivarSaprodi.ConditionL8d"),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+main_effects$WoundVsLight <- results(dds,
+  list("Condition_W2d_vs_Control", "Condition_L8d_vs_Control" ),
+  alpha = 0.05
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+      
+
+writexl::write_xlsx(main_effects, "./Results/DE_results.xlsx")
+
+
+saveRDS(main_effects, "./Results/Results.rds")
+
+descriptions <- cbind(sheet = names(main_effects), description = rep("Effect of ", length(names(main_effects)))) %>% as.data.frame()
+writexl::write_xlsx(descriptions, "./Description.xlsx")
+```
+
+
+```{r}
+dds2 <- dds[, dds$Condition == "Control"]
+dds2$starchTable <- factor(dds2$starchTable)
+design(dds2) <- ~starchTable
+dds2 <- DESeq(dds2, parallel = TRUE)
+dds2 <- estimateSizeFactors(dds2)
+resultsNames(dds2)
+Table_vs_Starch_DE <- results(dds2,
+  name = "starchTable_Table_vs_Starch",
+  alpha = 0.01
+) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "gene_id") %>%
+  arrange(padj) %>%
+  right_join(annotations,
+    {
+      .
+    },
+    by = "gene_id"
+  ) %>%
+  right_join(goslim_annotations_wide,
+    {
+      .
+    },
+    by = "gene_id"
+  )
+
+writexl::write_xlsx(Table_vs_Starch_DE, "./Results/Starch_Table/DE_results_starch_vstable.xlsx")
+saveRDS(Table_vs_Starch_DE, "./Results/Starch_Table/DE_results_starch_vstable.rds")
+
+```
+
+
+### Wound Light comparisons and interactions in starch potatose
+
+```{r}
+dds3 <- dds[, dds$starchTable == "Starch"]
+#dds2$starchTable <- factor(dds2$starchTable)
+design(dds3) <- ~1+Cultivar+Condition+Cultivar:Condition
+dds3$Cultivar <- droplevels(dds3$Cultivar)
+dds3$Condition <- droplevels(dds3$Condition)
+dds3 <- DESeq(dds3, parallel = TRUE)
+saveRDS(dds3, "./Results/Starch_Table/Starch_dds_res.rds")
+```
+
+
+```{r}
+
+res_starch <- resultsNames(dds3)[2:length(resultsNames(dds3))]
+
+Starch <- list()
+
+for (i in 1:length(res_starch)) {
+  Starch[[i]] <- results(dds3, name = res_starch[i], alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) %>%
+    right_join(annotations,
+      {
+        .
+      },
+      by = "gene_id"
+    ) %>%
+    right_join(goslim_annotations_wide,
+      {
+        .
+      },
+      by = "gene_id"
+    )
+
+  # print(mcols(results(dds, name = res_all[i],  alpha = 0.05))$description)
+}
+names(Starch) <- res_starch
+
+
+writexl::write_xlsx(Starch, "./Results/Starch_Table/DE_results_starch_LightWound.xlsx")
+saveRDS(Starch, "./Results/Starch_Table/DE_results_starch_LightWound.rds")
+```
+
+
+## Wound Light comparisons and interactions in Table potatose
+
+```{r}
+dds4 <- dds[, dds$starchTable == "Table"]
+#dds2$starchTable <- factor(dds2$starchTable)
+design(dds4) <- ~1+Cultivar+Condition+Cultivar:Condition
+dds4$Cultivar <- droplevels(dds4$Cultivar)
+dds4$Condition <- droplevels(dds4$Condition)
+dds4 <- DESeq(dds4, parallel = TRUE)
+saveRDS(dds4, "./Results/Starch_Table/Table_dds_res.rds")
+```
+
+
+```{r}
+res_table <- resultsNames(dds4)[2:length(resultsNames(dds4))]
+
+Table <- list()
+
+for (i in 1:length(res_table)) {
+  Table[[i]] <- results(dds4, name = res_table[i], alpha = 0.01) %>%
+    as.data.frame() %>%
+    rownames_to_column(., var = "gene_id") %>%
+    arrange(padj) %>%
+    right_join(annotations,
+      {
+        .
+      },
+      by = "gene_id"
+    ) %>%
+    right_join(goslim_annotations_wide,
+      {
+        .
+      },
+      by = "gene_id"
+    )
+
+  # print(mcols(results(dds, name = res_all[i],  alpha = 0.05))$description)
+}
+names(Table) <- res_table
+
+
+writexl::write_xlsx(Table, "./Results/Starch_Table/DE_results_Table_LightWound.xlsx")
+saveRDS(Table, "./Results/Starch_Table/DE_results_Table_LightWound.rds")
+```
+
+
+
+## PCA
+
+### Plot sample overview using PCA
+
+```{r eval=FALSE, include=FALSE}
+
+vstdds <- vst(dds)
+DESeq2::plotPCA(vstdds, intgroup="Cultivar")
+
+pca <- stats::prcomp(t(assays(vstdds)[[1]]))
+
+percentVarl <- pca$sdev^2 / sum(pca$sdev^2)
+
+pcamatl1 <- as.data.frame(pca$x)
+pcamatl2 <- as.data.frame(merge(pcamatl1, colData(dds), by = 0))
+pcamatl2
+```
+
+```{r}
+
+g <- ggplot(data = pcamatl2, aes_string(x = "PC1", y = "PC2", color = "Condition")) +
+  geom_point() +
+  xlab(paste0("PC1: ", round(percentVarl[1] * 100), "% variance")) +
+  ylab(paste0("PC2: ", round(percentVarl[2] * 100), "% variance")) +
+  geom_label(aes(label = Cultivar, size = NULL), nudge_y = 0.7) +
+  coord_fixed() +
+  theme_light()
+
+g
+
+ggsave(g,
+  file = paste("./Results/Figures/",
+    "PCA_scatter", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 15, width = 10
+)
+
+```
+
+## Cluster samples
+
+```{r  eval=FALSE, include=FALSE, echo = FALSE, fig.width=10, fig.height=18, warning = FALSE, message= FALSE}
+distsl <- dist(t(assays(vstdds)[[1]]))
+
+png("./Results/Figures/Sample_Clusters.png", units = "cm", height = 15, width = 25, res = 300)
+plot(hclust(distsl), lwd = 3)
+dev.off()
+```
+
+## Explained variance by PCs
+
+This step calculates explained variance by each principle component of the protein data.
+
+```{r eval=FALSE, include=FALSE}
+png("./Results/Figures/PC_VariancePlot.png", units = "cm", height = 24, width = 20, res = 300)
+barplot(percentVarl[1:10] * 100, ylab = "Percent varinace explained", xlab = "PC 1 to 10", main = "Percent variace explained by first 10 PCs (loess)", col = "purple")
+dev.off()
+```
+
+## Correlation of principle component with Phenotype data
+
+To identify the most relevant clinical variables associated with protein data, we calculate correlation between the principle components and the phenotype variables.
+
+```{r eval=FALSE, include=FALSE}
+pheno <- pcamatl2[, c("Cultivar", "Condition", "Condition2")]
+
+# pheno$Cultivar <- factor(pheno$Cultivar)
+# pheno$Condition <- factor(pheno$Condition)
+# pheno$Condition2 <- factor(pheno$Condition2)
+
+# pheno$npd <- factor(pheno$npd)
+# pheno$ind <- factor(pheno$ind)
+# cor(c(pcamat2[,2:11]), pcamat2$sizeFactor)
+
+pc_adj_rsq_l <- matrix(NA, ncol = 10, nrow = dim(pheno)[2])
+
+for (i in 1:dim(pheno)[2]) {
+  pc_adj_rsq_l[i, ] <- apply(pcamatl2[, 2:11], 2, function(x) summary(lm(x ~ pheno[, i]))$adj.r.squared)
+}
+colnames(pc_adj_rsq_l) <- colnames(pcamatl2[, 2:11])
+rownames(pc_adj_rsq_l) <- colnames(pheno)
+
+
+png("./Results/Figures/corrPlot.png", units = "cm", height = 24, width = 20, res = 300)
+pheatmap::pheatmap(pc_adj_rsq_l, display_numbers = TRUE, fontsize = 12, cluster_cols = FALSE, main = "Adj R^2 of Association between PCs and phenotypic variables")
+dev.off()
+```
+
+## Top 100 interacting genes and heatmaps
+
+```{r}
+library("genefilter") # genefilter: methods for filtering genes from high-throughput experiments
+
+Lightint <- lapply(main_effects[grep("ConditionL8d",names(main_effects))], filter, padj< 0.05 & abs(log2FoldChange) > 2 )
+
+lit_int <-  bind_rows(Lightint) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)  
+
+
+bind_rows(Lightint)$gene_id %>% unique()
+
+wnd_int <- lapply(main_effects[grep("ConditionW2d",names(main_effects))], filter, padj < 0.05 & abs(log2FoldChange) > 2)
+
+
+wnd_int <- bind_rows(wnd_int) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)
+```
+
+
+```{r}
+
+mat  <- assay(vstdds)[ wnd_int$gene_id, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds)[, c("Cultivar","Condition")])
+
+
+png("./Results/Figures/HeatMap_Cultivar_wound_interaction_top_100_allSamples.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+
+vstdds_wnd <- vstdds[, -(grep(vstdds$Sample, pattern = "L8d"))]
+mat1a  <- assay(vstdds_wnd)[ wnd_int$gene_id, ]
+mat1a  <- mat1a - rowMeans(mat1a)
+
+
+anno1a <- as.data.frame(colData(vstdds_wnd)[, c("Cultivar","Condition")])
+png("./Results/Figures/HeatMap_Cultivar_wound_interaction_top_100_onlyWound_Samples.png", units = "cm", height = 35, width = 20, res = 300)
+pheatmap(mat1a, annotation_col = anno1a ,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+```{r}
+mat2  <- assay(vstdds)[ lit_int$gene_id, ]
+mat2  <- mat2 - rowMeans(mat2)
+anno <- as.data.frame(colData(vstdds)[, c("Cultivar","Condition")])
+png("./Results/Figures/HeatMap_Cultivar_light_interaction_top100_allSamples.png", units = "cm", height = 45, width = 35, res = 300)
+pheatmap(mat2, annotation_col = anno,  fontsize = 8, fontsize_row = 5)
+dev.off()
+
+vstdds_l8 <- vstdds[, -(grep(vstdds$Sample, pattern = "W2d"))]
+mat2a  <- assay(vstdds_l8)[ lit_int$gene_id, ]
+mat2a  <- mat2a - rowMeans(mat2a)
+anno2a <- as.data.frame(colData(vstdds_l8)[, c("Cultivar","Condition")])
+png("./Results/Figures/HeatMap_Cultivar_light_interaction_top100_onlyLightSamples.png", units = "cm", height = 45, width = 25, res = 300)
+pheatmap(mat2a, annotation_col = anno2a,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+## Heatmap starch
+
+```{r}
+vstdds3 <- vst(dds3)
+#vstdds4 <- vst(dds4)
+Lightint_S <- lapply(Starch[grep("ConditionL8d",names(Starch))], filter, padj< 0.05 & abs(log2FoldChange) > 2 )
+
+lit_int_s <-  bind_rows(Lightint_S) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)  
+
+
+wnd_int_s <- lapply(Starch[grep("ConditionW2d",names(Starch))], filter, padj < 0.05 & abs(log2FoldChange) > 2)
+
+wnd_int_s <- bind_rows(wnd_int_s) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)
+
+```
+
+
+### Wound
+
+```{r}
+mat  <- assay(vstdds3)[ wnd_int_s$gene_id, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds3)[, c("Cultivar","Condition")])
+
+
+png("./Results/Starch_Table/Figures_Starch/HeatMap_Cultivar_wound_interaction_top_100_allSamples.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+
+vstdds3_wnd <- vstdds3[, -(grep(vstdds3$Sample, pattern = "L8d"))]
+mat1a  <- assay(vstdds3_wnd)[ wnd_int_s$gene_id, ]
+mat1a  <- mat1a - rowMeans(mat1a)
+
+
+anno1a <- as.data.frame(colData(vstdds3_wnd)[, c("Cultivar","Condition")])
+png("./Results/Starch_Table/Figures_Starch/HeatMap_Cultivar_wound_interaction_top_100_onlyWound_Samples.png", units = "cm", height = 35, width = 20, res = 300)
+pheatmap(mat1a, annotation_col = anno1a ,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+### Light
+
+```{r}
+mat  <- assay(vstdds3)[ lit_int_s$gene_id, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds3)[, c("Cultivar","Condition")])
+
+
+png("./Results/Starch_Table/Figures_Starch/HeatMap_Cultivar_light_interaction_top_100_allSamples.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+
+vstdds3_lit <- vstdds3[, -(grep(vstdds3$Sample, pattern = "W2d"))]
+mat1a  <- assay(vstdds3_lit)[ lit_int_s$gene_id, ]
+mat1a  <- mat1a - rowMeans(mat1a)
+
+
+anno1a <- as.data.frame(colData(vstdds3_lit)[, c("Cultivar","Condition")])
+png("./Results/Starch_Table/Figures_Starch/HeatMap_Cultivar_light_interaction_top_100_onlylight_Samples.png", units = "cm", height = 35, width = 20, res = 300)
+pheatmap(mat1a, annotation_col = anno1a ,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+## Heatmap table
+
+```{r}
+#vstdds3 <- vst(dds3)
+vstdds4 <- vst(dds4)
+Lightint_t <- lapply(Table[grep("ConditionL8d",names(Table))], filter, padj< 0.05 & abs(log2FoldChange) > 2 )
+
+lit_int_t <-  bind_rows(Lightint_t) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)  
+
+
+wnd_int_t <- lapply(Table[grep("ConditionW2d",names(Table))], filter, padj < 0.05 & abs(log2FoldChange) > 2)
+
+wnd_int_t <- bind_rows(wnd_int_t) |> arrange(padj) |> filter(baseMean > 50 ) |> distinct(gene_id, .keep_all = TRUE) |> top_n(wt = abs(log2FoldChange), 100)
+
+```
+
+
+### Wound
+
+```{r}
+mat  <- assay(vstdds4)[ wnd_int_t$gene_id, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds4)[, c("Cultivar","Condition")])
+
+
+png("./Results/Starch_Table/Figures_table/HeatMap_Cultivar_wound_interaction_top_100_allSamples.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+
+vstdds4_wnd <- vstdds4[, -(grep(vstdds4$Sample, pattern = "L8d"))]
+mat1a  <- assay(vstdds4_wnd)[ wnd_int_t$gene_id, ]
+mat1a  <- mat1a - rowMeans(mat1a)
+
+
+anno1a <- as.data.frame(colData(vstdds4_wnd)[, c("Cultivar","Condition")])
+png("./Results/Starch_Table/Figures_table/HeatMap_Cultivar_wound_interaction_top_100_onlyWound_Samples.png", units = "cm", height = 35, width = 20, res = 300)
+pheatmap(mat1a, annotation_col = anno1a ,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+### Light
+
+```{r}
+mat  <- assay(vstdds4)[ lit_int_t$gene_id, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds4)[, c("Cultivar","Condition")])
+
+
+png("./Results/Starch_Table/Figures_table/HeatMap_Cultivar_light_interaction_top_100_allSamples.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+
+vstdds4_lit <- vstdds4[, -(grep(vstdds4$Sample, pattern = "W2d"))]
+mat1a  <- assay(vstdds4_lit)[ lit_int_t$gene_id, ]
+mat1a  <- mat1a - rowMeans(mat1a)
+
+
+anno1a <- as.data.frame(colData(vstdds4_lit)[, c("Cultivar","Condition")])
+png("./Results/Starch_Table/Figures_table/HeatMap_Cultivar_light_interaction_top_100_onlylight_Samples.png", units = "cm", height = 35, width = 20, res = 300)
+pheatmap(mat1a, annotation_col = anno1a ,  fontsize = 8, fontsize_row = 5)
+dev.off()
+```
+
+## Glyco genes
+
+```{r}
+Glyco_genes <- read_csv("./PotatoNGS1/glyco_genes.txt")
+Glyco_genes_new <- intersect(rownames(assay(vstdds)) , Glyco_genes$glyco)
+mat  <- assay(vstdds)[ Glyco_genes_new, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vstdds)[, c("Cultivar","Condition")])
+
+png("./Results/Figures/Glyc_genes.png", units = "cm", height = 35, width = 25, res = 300)
+pheatmap(mat, annotation_col = anno,  fontsize = 7, fontsize_row = 6)
+dev.off()
+```
+
+
+
+```{r}
+library("ggbeeswarm") # Categorical Scatter (Violin Point) Plots
+geneCounts <- plotCounts(dds, gene = topGene, intgroup = c("dex","cell"),
+                         returnData = TRUE)
+ggplot(geneCounts, aes(x = dex, y = count, color = cell)) +
+  scale_y_log10() +  geom_beeswarm(cex = 3)
+```
+
+
+## Volcano plots 
+
+```{r}
+library(EnhancedVolcano) # Publication-ready volcano plots with enhanced colouring andlabeling
+ev <- EnhancedVolcano(main_effects$Condition_L8d_vs_Control,
+  lab = main_effects$Condition_L8d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(main_effects$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Light vs. Control",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev, filename = "./Results/Figures/Light_vs_Control.png")
+
+ev1 <- EnhancedVolcano(main_effects$Condition_W2d_vs_Control,
+  lab = main_effects$Condition_W2d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(main_effects$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Wound vs. Control",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev1, filename = "./Results/Starch_Table/Figures/Wound_vs_Light.png")
+
+
+
+ev11 <- EnhancedVolcano(main_effects$WoundVsLight,
+  lab = main_effects$WoundVsLight$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(main_effects$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Wound vs. Light",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev11, filename = "./Results/Figures/Wound_vs_Light.png")
+```
+
+## Volcano Plots for starch vs. table
+
+```{r}
+ev2 <- EnhancedVolcano(Table_vs_Starch_DE,
+  lab = Table_vs_Starch_DE$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(main_effects$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+  xlim = c(-10,10) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Table vs. Starch",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev2, filename = "./Results/Figures/Table_vs_Starch.png")
+
+```
+
+
+## Volcano Plots Starch: Light, Wound interactions
+
+
+```{r}
+library(EnhancedVolcano) # Publication-ready volcano plots with enhanced colouring andlabeling
+ev <- EnhancedVolcano(Starch$Condition_L8d_vs_Control,
+  lab = Starch$Condition_L8d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(Starch$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Light vs. Control in Starch potatoes",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev, filename = "./Results/Starch_Table/Figures_Starch/Light_vs_Control.png")
+
+ev1 <- EnhancedVolcano(Starch$Condition_W2d_vs_Control,
+  lab = Starch$Condition_W2d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(Starch$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Wound vs. Control in starch potatoes",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev1, filename = "./Results/Starch_Table/Figures_Starch/Wound_vs_Control.png")
+
+
+```
+
+## Volcano Plots Table: Light, Wound interactions
+
+
+```{r}
+library(EnhancedVolcano) # Publication-ready volcano plots with enhanced colouring andlabeling
+ev <- EnhancedVolcano(Table$Condition_L8d_vs_Control,
+  lab = Table$Condition_L8d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(Table$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Light vs. Control in Table potatoes",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev, filename = "./Results/Starch_Table/Figures_table/Light_vs_Control.png")
+
+ev1 <- EnhancedVolcano(Table$Condition_W2d_vs_Control,
+  lab = Table$Condition_W2d_vs_Control$gene_id,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.01,
+  labSize = 2,
+  #ylim = c(0, max(-log10(Table$Condition_L8d_vs_Control$padj), na.rm = TRUE) + 1),
+  FCcutoff = 2,
+ # xlim = c(-2.5,2.5) , 
+   #legendLabels = c("Not significant", "", "adj. P val < 0.05", "adj Pval < 0.05 & effect size >/< 0.01"),
+# transcriptPointSize = 1.5,
+  title = "Wound vs. Control in Table potatoes",
+  subtitle = "",
+  boxedLabels = FALSE,
+  shadeBins = 4,
+  legendLabSize = 10
+)
+ggsave(ev1, filename = "./Results/Starch_table/Figures_table/Wound_vs_Control.png")
+
+
+
+```
+
+
+

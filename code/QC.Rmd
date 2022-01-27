@@ -1,0 +1,745 @@
+---
+title: | 
+  | Section: 
+  | Ovarian Proteomics: QC on the proteomics data
+output:
+  bookdown::html_document2:
+    theme: journal
+    highlight: kate
+    df_print: paged
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    code_folding: hide
+    css: "style.css"
+date: "`r format(Sys.time(), '%d %B, %Y')`"    
+bibliography: references.bib 
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r knitr, include=FALSE}
+# knitr
+knitr::opts_chunk$set(echo = TRUE, 
+                      collapse = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache = FALSE, 
+                      cache.path = "../cache/", 
+                      fig.height = 5, 
+                      fig.width = 6,
+                      eval=TRUE)
+```
+
+# Purpose 
+The main aim of the analyses is to QC the protein data and identify any outlier samples and batch effects
+
+
+## Issues to discuss
+
+
+ - Missing values
+ - Normalization 
+ - Variables to regress, time, death, ???
+
+ 
+
+## QC of data
+
+```{r setup1, echo=FALSE ,include=FALSE}
+# import libraries and data
+renv::init()
+library(tidyverse)
+library(reshape2)
+library(magrittr)
+library(readxl)
+library(fuzzyjoin)
+library(limma)
+library(DBI)
+library(VIM)
+library(factoextra)
+library(FactoMineR)
+library(mice)
+library(SummarizedExperiment)
+
+
+library(RColorBrewer)
+library(GGally)
+library(ggiraphExtra)
+library(knitr)
+library(kableExtra)
+library(plotly)
+library(RankAggreg)
+library(DT)
+library(ggVennDiagram)
+```
+
+
+```{r setup1, echo=FALSE ,include=FALSE}
+nn_sp_report <- read_tsv("../20210411_125835_Niklas N direct DIA_Report.xls", 
+                       col_names = TRUE
+                        )
+
+sample_prep <- readxl::read_xlsx("../2021-03-05 Niklas Niehlsen with sample preparation dates.xlsx")
+sample_clin <- readxl::read_xlsx("../Region.Skane.TTM1.Biobank_Chsoen_for_currentanalysis.xlsx") # The clinical data provided. The data contained wrong sample identifiers and one 0 was missing ans well as Malmo samples were coded as MAMO in the clinical data while the label was coded as MAL in the protein data.
+# set seed for imputations
+set.seed(20210527)
+
+head(nn_sp_report)
+```
+
+```{r}
+#nn_sp_report_unq_pep <- '.*?PG.Quantity'
+nn_sp_report_un_pep <- nn_sp_report %>% distinct(PG.ProteinGroups,.keep_all = TRUE) %>% ungroup() # remove repeated values. The peptide level data is not provided, instead protein intensity was repeated for each protein.
+
+nn_sp_report_un_pep <- nn_sp_report_un_pep %>% mutate(ID = str_split(PG.ProteinGroups, simplify = TRUE, pattern = ";")[,1], .before=1) # Add protein ID column (First in the protein list)
+
+nn_sp_report_un_pept <- nn_sp_report_un_pep %>% select(contains(c("ID",'PG.Quantity'))) # Select the columns containing protein quantity
+
+### Prepare the sample meta data by combining sample preparation sheet, annotations extracted from the protein column names and the clinical data provided. 
+samples <- colnames(nn_sp_report_un_pept)[-1] # 
+col_data <- data.frame(time = str_match(samples, "-[0-9]{2}-"),  sample =  str_split(str_split(samples, ".htrms.", simplify = TRUE)[,1], pattern = " ", simplify = TRUE)[,2] )
+col_data <- col_data %>%  mutate(screening_number = str_sub(sample, start = 1, end = 9)  )
+
+col_data <- left_join(col_data, sample_prep, by = c("sample"="Sample ID"))
+rownames(col_data) <- col_data$sample
+sample_clin <- as.data.frame(sample_clin[, -1])
+col_data <- left_join(col_data, sample_clin, by= c("screening_number"="screening_number"), copy = TRUE)
+rownames(col_data) <- col_data$sample
+
+### Prepare the rowData from the row annotations
+row_data <- nn_sp_report_un_pep[, 1:6]
+rownames(row_data) <- nn_sp_report_un_pept$ID
+
+raw_data <- as.matrix(nn_sp_report_un_pept[, samples])
+rownames(raw_data) <- nn_sp_report_un_pept$ID
+
+raw_data <- matrix(nn_sp_report_un_pept[, samples], dimnames = list(nn_sp_report_un_pept$ID, col_data$sample))
+is.na(raw_data) %>% rowSums()
+row_data <- row_data %>% mutate(ID = str_split(PG.ProteinGroups, simplify = TRUE, pattern = ";")[,1])
+raw_data[is.nan(raw_data)] <- NA
+
+sumExpObj <- SummarizedExperiment::SummarizedExperiment(assays = list(raw_data = raw_data),
+    colData=col_data,
+    rowData=row_data
+)
+saveRDS(sumExpObj, "../rawaDataSe.rds")
+```
+
+
+## Analyze missingness 
+
+```{r}
+sumExpObj <- readRDS("../rawaDataSe.rds")
+#setwd("../missing/")
+colData(sumExpObj)
+colData(sumExpObj)$timepoint <- colData(sumExpObj)$time %>% as.factor() %>% as.integer() %>% as.character()
+colnames(sumExpObj) <- paste0(colData(sumExpObj)$screening_number, "_", colData(sumExpObj)$timepoint )
+
+## Analyze missingness and Impute for PCA etc
+#Data_se <- readRDS("../Data/data_sumExp.rds")
+
+missing <-mice::md.pattern(assays(sumExpObj)$raw_data)
+
+png("../missing/missingProt.png", res = 300, width = 12000, height = 8000)
+mice_prot <- aggr(t(assays(sumExpObj)$raw_data), col=c('navyblue','yellow'),
+ numbers=TRUE, sortVars=TRUE,
+ labels=sumExpObj$screening_number, cex.axis=1,
+ gap=1, ylab=c("Missing data","Pattern"))
+dev.off()
+
+mice_prot$missings$Count %>% hist(breaks=200)
+
+
+png("../missing/missingSamples.png", res = 300, width = 8000, height = 3000)
+mice_sample <- aggr(assays(sumExpObj)$raw_data, col=c('navyblue','yellow'),
+ numbers=TRUE, sortVars=TRUE,
+ labels=sumExpObj$screening_number, cex.axis=.4,
+ gap=2, ylab=c("Missing data","Pattern"))
+dev.off()
+
+sumExpObj_filt <- sumExpObj[mice_prot$missings[mice_prot$missing$Count <30,]$Variable,]
+
+imp <- mice(assays(sumExpObj_filt)$raw_data, maxit = 0)
+
+predM = imp$predictorMatrix
+meth = imp$method
+set.seed(123)
+imp2 <- mice(assays(sumExpObj_filt)$raw_data, m=3, method = "cart")
+
+imp3 <-  mice::complete(imp2, 1)
+
+assays(sumExpObj_filt)$imputed_raw <- imp3
+
+#saveRDS(sumExpObj_filt, "../data_sumExpfilImp.rds")
+sumExpObj <- readRDS("../data_sumExpfilImp.rds")
+```
+
+```{r}
+clin_vars <- c("Batch"  ,"Sample.preparation.date", "time","randomisation_code", "dead24",	"dead48",	"dead72","binarysecout180daycpcscore", "b_age",	"b_sex", "p_ca_to_rosc_min", "a_shock_on_admission", "shockable", "awakeday1",	"awakeday2",	"awakeday3")
+inflam <- c("il6_1",	"il6_2",	"il6_3", "copeptin_1",	"copeptin_2",	"copeptin_3",	"crea_1",	"crea_2",	"crea_3",	"crp_1",	"crp_2",	"crp_3")
+tech_var <- c("Batch"  ,"Sample.preparation.date" )
+colData(sumExpObj)[, clin_vars]
+```
+
+
+## PCA
+
+```{r}
+library()
+library("FactoMineR")
+
+res.pca <- PCA(t(log2(assays(sumExpObj_filt)$imputed_raw)),  graph = TRUE)
+```
+
+
+```{r}
+fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+```{r}
+rowData(sumExpObj)$na_per <- (rowSums(is.na(assay(sumExpObj)))/dim(sumExpObj)[2])*100
+sumExpObj_filt <- sumExpObj[rowData(sumExpObj)$na_per <30 , ]
+assay(sumExpObj_filt, "log2plus1") <- log2(assay(sumExpObj))+1
+
+```
+
+```{r}
+limma::plotDensities(log2(assays(sumExpObj_filt)$imputed_raw), sumExpObj_filt$time)
+```
+
+```{r}
+
+limma::plotDensities(log2(assays(sumExpObj_filt)$raw_data), sumExpObj_filt$time)
+
+```
+
+```{r}
+
+assays(sumExpObj_filt)$vsn <- limma::normalizeVSN(assays(sumExpObj_filt)$raw_data)
+
+limma::plotDensities(assays(sumExpObj_filt)$vsn, sumExpObj_filt$time)
+```
+
+```{r}
+vsn::meanSdPlot(assays(sumExpObj_filt)$vsn)
+```
+
+
+```{r}
+
+assays(sumExpObj_filt)$loess <- limma::normalizeCyclicLoess(log2(assays(sumExpObj_filt)$raw_data), iterations = 3) # Normalize using Loess on log2 trnasformed data
+limma::plotDensities(assays(sumExpObj_filt)$loess, sumExpObj_filt$time)
+```
+
+```{r}
+
+
+#assays(sumExpObj_filt)$batch_loess <- limma::removeBatchEffect(log2(assays(sumExpObj_filt)$loess), batch = sumExpObj_filt$Batch)
+limma::plotDensities(assays(sumExpObj_filt)$loess, sumExpObj_filt$time)
+saveRDS(sumExpObj_filt, "../data_sumExpfilImp.rds")
+```
+
+```{r}
+res.pca_loess <- PCA(t(assays(sumExpObj_filt)$loess),  graph = TRUE)
+```
+
+```{r}
+exp_var <- fviz_screeplot(res.pca_loess, addlabels = TRUE, ylim = c(0, 12))
+ggsave(exp_var,
+  file = paste("../",
+    "explained_var", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+```
+
+```{r}
+# scores plot (interactive)
+ind <- get_pca_ind(res.pca_loess)
+ind
+fviz_pca_ind(res.pca, col.ind = "cos2", 
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )
+pca.frame <- data.frame(PC1 = round(res.pca$ind$coord[,1], 2), 
+                        PC2 = round(res.pca$ind$coord[,2], 2), 
+                        PC3 = round(res.pca$ind$coord[,3], 2), 
+                        PC4 = round(res.pca$ind$coord[,4], 2),
+                        PC5 = round(res.pca$ind$coord[,5], 2),
+                        group = factor(data.naomit$Group, labels = c("Low", "High")),
+                        SCANB = data.naomit$SCANB)
+
+  
+pca.var <- res.pca$eig[,3] %>%
+  round(2)
+  
+
+```
+
+### PCA analyses
+
+Principle component analyses was used to perform exploratory analyses of the proteomics data. Explained variance by each principle component was calculated using the output from prcomp´ function in R. Correlation between principle components and phenotype (clinical) variables was calculated using ´lm´ function in R and "adj.r.squared" values were extracted from the summary statistics produced by the ´lm´ function.
+
+```{r, eval = FALSE,include=FALSE,  echo = FALSE, fig.width=10, fig.height=18, warning = FALSE, message= FALSE}
+is.na(assays(Data_se_comp)$imputed) %>% sum()
+
+pcaobjl <- stats::prcomp(t(na.omit(assays(sumExpObj_filt)$loess)), )
+
+percentVarl <- round(pcaobjl$sdev^2 / sum(pcaobjl$sdev^2),2)*100
+
+pcamatl1 <- as.data.frame(pcaobjl$x)
+pcamatl2 <- as.data.frame(merge(pcamatl1, colData(sumExpObj_filt), by = 0))
+pcamatl2
+```
+
+### Plot sample overview using PCA
+
+```{r eval=FALSE, include=FALSE}
+plot.pca1 <- ggplot(pcamatl2, aes(PC1, PC2, color = Batch, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
+  theme_bw() + 
+   geom_text(
+    label=pcamatl2$time, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) + 
+  ggtitle("PCA color indicating the batch and lable indicating the time-point") +
+  theme(legend.title = element_blank())
+
+#ggplotly(plot.pca12)
+
+ggsave(plot.pca1,
+  file = paste("../",
+    "PCA_batch_time", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+randomisation_code
+
+plot.pca12 <- ggplot(pcamatl2, aes(PC1, PC2, color = Batch, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
+  theme_bw() + 
+  geom_text(
+    label=pcamatl2$randomisation_code, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) +
+  ggtitle("PCA color indicating the batch and lable indicating the temperature group") +
+  theme(legend.title = element_blank())
+plot.pca12  
+ggsave(plot.pca12,
+  file = paste("../",
+    "PCA_batch_rand_code", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+```
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+pca <- stats::prcomp(t(na.omit(assays(sumExpObj_filt)$loess)), )
+
+g <- ggbiplot(pca,
+  obs.scale = 1, var.scale = 1,
+  groups = sumExpObj_filt$time, ellipse = T,
+  circle = TRUE, var.axes = F, labels = sumExpObj_filt$Batch
+) +
+  scale_color_discrete(name = "") +
+  theme(
+    legend.direction = "horizontal",
+    legend.position = "top"
+  ) +
+  theme_bw()
+
+ggsave(g,
+  file = paste("../Results/Figures/",
+    "PCA_lables", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 15, width = 10
+)
+
+
+```
+
+## Cluster samples
+
+```{r  eval=FALSE, include=FALSE, echo = FALSE, fig.width=20, fig.height=18, warning = FALSE, message= FALSE}
+distsl <- dist(t(assays(sumExpObj_filt)$loess))
+plot(hclust(distsl))
+```
+
+## Explained variance by PCs
+
+This step calculates explained variance by each principle component of the protein data.
+
+```{r eval=FALSE, include=FALSE}
+png("../Results/Figures/PC_VariancePlot.png", units = "cm", height = 24, width = 20, res = 300)
+barplot(percentVarl[1:10] , ylab = "Percent varinace explained", xlab = "PC 1 to 10", main = "Percent variace explained by first 10 PCs (loess)", col = "purple")
+dev.off()
+```
+
+## Correlation of principle component with Phenotype data
+
+To identify the most relevant clinical variables associated with protein data, we calculate correlation between the principle components and the phenotype variables.
+
+```{r eval=FALSE, include=FALSE}
+
+pheno <- pcamatl2[ ,clin_vars]
+
+pc_adj_rsq_l <- matrix(NA, ncol = 10, nrow = dim(pheno)[2])
+
+for (i in 1:dim(pheno)[2]) {
+  pc_adj_rsq_l[i, ] <- apply(pcamatl2[, 2:11], 2, function(x) summary(lm(x ~ pheno[, i]))$adj.r.squared)
+}
+colnames(pc_adj_rsq_l) <- colnames(pcamatl2[, 2:11])
+rownames(pc_adj_rsq_l) <- colnames(pheno)
+
+
+png("../corrPlot_updated.png", units = "cm", height = 24, width = 20, res = 300)
+pheatmap::pheatmap(pc_adj_rsq_l, display_numbers = TRUE, fontsize = 12, cluster_cols = FALSE, main = "Adj R^2 of Association between PCs and clinical  and technical variables")
+dev.off()
+```
+
+## PCA using VSN normalization
+
+```{r}
+res.pca_vsn <- PCA(t(assays(sumExpObj_filt)$vsn),  graph = TRUE)
+```
+
+```{r}
+exp_var_vsn <- fviz_screeplot(res.pca_vsn, addlabels = TRUE, ylim = c(0, 12))
+ggsave(exp_var_vsn,
+  file = paste("../",
+    "explained_var_vsn", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+```
+
+
+```{r, eval = FALSE,include=FALSE,  echo = FALSE, fig.width=10, fig.height=18, warning = FALSE, message= FALSE}
+is.na(assays(Data_se_comp)$imputed) %>% sum()
+
+pcaobjl_vsn <- stats::prcomp(t(na.omit(assays(sumExpObj_filt)$vsn)), )
+
+percentVarl_vsn <- round(pcaobjl_vsn$sdev^2 / sum(pcaobjl_vsn$sdev^2),2)*100
+
+pcamatl1_vsn <- as.data.frame(pcaobjl_vsn$x)
+pcamatl2_vsn <- as.data.frame(merge(pcamatl1_vsn, colData(sumExpObj_filt), by = 0))
+pcamatl2_vsn
+```
+
+### Plot sample overview using PCA
+
+```{r eval=FALSE, include=FALSE}
+plot.pca1_vsn <- ggplot(pcamatl2_vsn, aes(PC1, PC2, color = Batch, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl_vsn[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl_vsn[2], "% variance", sep="")) + 
+  theme_bw() + 
+   geom_text(
+    label=pcamatl2$time, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) + 
+  ggtitle("PCA color indicating the batch and lable indicating the time-point") +
+  theme(legend.title = element_blank())
+
+#ggplotly(plot.pca12)
+
+ggsave(plot.pca1_vsn,
+  file = paste("../",
+    "PCA_batch_time_vsn", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+
+
+plot.pca12_vsn <- ggplot(pcamatl2_vsn, aes(PC1, PC2, color = Batch, text = Row.names)) + 
+  geom_point(size=2, alpha = 0.9) + 
+  scale_colour_brewer(palette = "Set2") + 
+  xlab(paste("PC1: ", percentVarl_vsn[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", percentVarl_vsn[2], "% variance", sep="")) + 
+  theme_bw() + 
+  geom_text(
+    label=pcamatl2_vsn$randomisation_code, 
+    nudge_x = 0.25, nudge_y = 0.25, 
+    check_overlap = T
+  ) +
+  ggtitle("PCA color indicating the batch and lable indicating the temperature group") +
+  theme(legend.title = element_blank())
+plot.pca12  
+ggsave(plot.pca12_vsn,
+  file = paste("../",
+    "PCA_batch_rand_code_vsn", ".png",
+    sep = ""
+  ),
+  scale = 2,
+  units = "cm", height = 10, width = 15
+)
+```
+
+
+
+
+
+## Correlation of principle component with Phenotype data
+
+To identify the most relevant clinical variables associated with protein data, we calculate correlation between the principle components and the phenotype variables.
+
+```{r eval=FALSE, include=FALSE}
+
+pheno <- pcamatl2_vsn[ ,clin_vars]
+
+pc_adj_rsq_l_vsn <- matrix(NA, ncol = 10, nrow = dim(pheno)[2])
+
+for (i in 1:dim(pheno)[2]) {
+  pc_adj_rsq_l_vsn[i, ] <- apply(pcamatl2_vsn[, 2:11], 2, function(x) summary(lm(x ~ pheno[, i]))$adj.r.squared)
+}
+colnames(pc_adj_rsq_l_vsn) <- colnames(pcamatl2_vsn[, 2:11])
+rownames(pc_adj_rsq_l_vsn) <- colnames(pheno)
+
+
+png("../corrPlot_updated_vsn.png", units = "cm", height = 24, width = 20, res = 300)
+pheatmap::pheatmap(pc_adj_rsq_l_vsn, display_numbers = TRUE, fontsize = 12, cluster_cols = FALSE, main = "Adj R^2 of Association between PCs and clinical  and technical variables")
+dev.off()
+```
+
+## Save the filtered data and PCs
+
+```{r}
+colData(sumExpObj_filt) <- merge(colData(sumExpObj_filt), pcamatl1[, 1:15], by = 0)
+#saveRDS(sumExpObj_filt, "../normalized_filtered_se.rds")
+```
+
+
+
+
+-------------------------------
+
+```{r setup2, echo=TRUE ,include=TRUE}
+
+# Get Quantities of PG.ProteinGroups
+nn_sp_report_l <- melt(data = nn_sp_report, id.vars = "PG.ProteinGroups", measure.vars = na.omit(str_match(colnames(nn_sp_report), '.*?PG.Quantity'))[,1], variable.name = 'sample')
+
+# table of missing values count
+nn_missing <- nn_sp_report_l %>% distinct(`PG.ProteinGroups`,sample,value) %>% group_by(sample) %>% mutate(sum_na = sum(is.nan(value))) %>% ungroup() %>% 
+  group_by(`PG.ProteinGroups`) %>% mutate(sum_na_prot = sum(is.nan(value))) %>% mutate(sum_pep = length(`PG.ProteinGroups`)) %>% dplyr::select(`PG.ProteinGroups`,sample,sum_na, sum_na_prot, sum_pep)
+
+# CK imputation method
+max.impute.value <- nn_sp_report_l %>%
+    group_by(`PG.ProteinGroups`) %>%
+    summarise(min_int = min(value, na.rm = T)) %>%
+    mutate(max_imp = 0.5*min_int)
+nn_sp_report_l <- nn_sp_report_l %>%
+    left_join(max.impute.value) %>%
+    dplyr::rowwise() %>%
+    mutate(Imputed = if_else(is.nan(value),TRUE, FALSE)) %>%
+    mutate(value = if_else(is.nan(value), runif(1,min = 0.005*max_imp, max = max_imp), value))
+
+# log2 of value (intensity)
+nn_sp_report_l <- nn_sp_report_l %>% mutate(log2_val = log2(value))   
+
+# Calculate protein groups quantitative intensity (quant_int) and also log10, select unique protein - sample relation  
+nn_sp_report_l <- nn_sp_report_l %>% group_by(`PG.ProteinGroups`, sample) %>% mutate(quant_int = mean(value), quant_int_log10 = log10(quant_int)) %>% ungroup() %>% distinct(`PG.ProteinGroups`,sample,quant_int,quant_int_log10,Imputed)
+
+# Normalize by subtraction of mean 
+nn_sp_report_l <- nn_sp_report_l %>% group_by(sample) %>% mutate(scale_log10 = scale(quant_int_log10))
+
+# Add timepoint column by splitting the sample identifier
+nn_sp_report_l <- dplyr::rowwise(nn_sp_report_l) %>% mutate("time" = str_match(sample, "-[0-9]{2}-"), 
+                                                            "sample" =  str_split(str_split(sample, ".htrms.")[[1]][1], " ")[[1]][2]) 
+# Get total count of proteins (1 protein count per protein group)
+total_pro <- nn_sp_report_l %>% dplyr::select(`PG.ProteinGroups`) %>% ungroup() %>% distinct(`PG.ProteinGroups`) %>% add_count(., name = "proteins")
+
+# Make new table for peptide and protein counts
+total_all <- cbind(total_pro[1,"proteins"])
+colnames(total_all) <- c('proteins')
+ta <- melt(data = total_all, measure.vars = colnames(total_all), variable.name = "id")
+
+
+
+```
+
+
+```{r setup3, echo=TRUE}
+# Use RSQLite to count proteins
+db <- dbConnect(RSQLite::SQLite(),"")
+dbWriteTable(db,"nn_sp", nn_sp_report_l)
+dbListTables(db)
+nn_sp_report_counted <- dbGetQuery(db, 'SELECT `PG.ProteinGroups`,nn_sp.sample,quant_int,quant_int_log10,scale_log10,time,protein_count,Imputed FROM nn_sp LEFT JOIN(SELECT sample,count(Imputed) AS protein_count FROM nn_sp WHERE Imputed == 0 GROUP BY sample) AS pt ON pt.sample = nn_sp.sample')
+
+dbDisconnect(db)
+
+```
+
+Run normalizeVSN from limma:
+```{r normalizeVSN, echo=TRUE}
+db <- dbConnect(RSQLite::SQLite(),"")
+df_w <- dcast(nn_sp_report_l, `PG.ProteinGroups` ~ sample,value.var = "scale_log10")
+rownames(df_w) <- df_w[,1]
+
+df_imp <- dcast(nn_sp_report_l, `PG.ProteinGroups` ~ sample,value.var = "Imputed")
+rownames(df_imp) <- df_imp[,1]
+df_w[which(df_imp==TRUE)]
+
+df_w <- as.matrix(df_w[,-1])
+df_imp <- as.matrix(df_imp[,-1])
+df_w_norm <- limma::normalizeVSN(df_w[,-1])
+df_l_norm <- melt(data = df_w_norm, id.vars = rownames(df_w_norm), measure.vars = colnames(df_w_norm), variable.name = "sample" )
+df_l_norm <- df_l_norm %>% rename("norm_log10" = "value")
+nn_sp_report_counted <- left_join(nn_sp_report_counted, df_l_norm, by = c("PG.ProteinGroups"="Var1","sample"="Var2"))
+
+```
+Choose Random samples for plotting:
+```{r sample_samples, echo=TRUE}
+result_table <- nn_sp_report_counted
+# distributions of sample of samples
+samples <- result_table %>% distinct(sample) %>% as.list()
+s = sample(samples$sample, 16)
+
+```
+
+
+```{r subsets_samples, echo=TRUE} 
+# function for breaking down samples in subsets 
+subset_samples <- function(sample_list, step){
+  count <- 0
+  subset_list <- list()
+  for (i in seq(1,length(sample_list), by=step)){
+    count <- count + 1
+    subset_list[[count]] <- sample_list[i:(i+step-1)]
+    
+    }
+return(subset_list)
+}
+
+# distributions of sample of samples
+samples <- result_table %>% distinct(sample) %>% as.list()
+s = sample(samples$sample, 16)
+subset_list <- subset_samples(samples$sample, 16)
+```
+
+
+Write dataset output:
+```{r write_output, echo=TRUE}
+write_tsv(nn_sp_report_counted,"/home/rstudio/data/01_quality_check_table_directDIA.tsv" )
+
+```
+
+
+Plot total counts and counts by sample:
+```{r total_counts, echo=TRUE, fig.height=6, fig.width=8}
+# Plot total counts
+title <- "Total counts"
+total_count  <- ggplot(ta %>% 
+                         rename("count" = "value","proteins" = "id"), 
+                         aes(proteins,count)) +
+  geom_bar(position = "dodge",stat = "identity") +
+  theme(axis.text.x= element_text(angle = 90, vjust = 1, hjust=1 ,size = 8)) + 
+  geom_text(aes(label = count), size = 4, color = "white", vjust= 1.5) +
+  ggtitle(paste0(title)) 
+(total_count)
+
+# protein count by sample
+title <- "Protein intensity by count"
+plt_prot_dot_z <- ggplot(result_table %>% 
+                        group_by(sample) %>% 
+                        mutate(mean_quant_int = mean(quant_int)), 
+                        aes(protein_count, mean_quant_int, colour = time)) +
+                        geom_point() +
+  theme(axis.text.x= element_text(angle = 0, vjust = 1, hjust=0.5 ,size = 10)) + 
+  ggtitle(paste0(title)) 
+(plt_prot_dot_z)
+
+```
+
+Boxplots to visualize sample variation before and after normalization:  
+```{r plot2, echo=TRUE,  fig.height=6, fig.width=8}
+
+# Boxplot before normalization 
+title <- "Before normalization: Box plot of log10"
+plt_box <- ggplot(result_table %>% filter(sample %in% s), aes(sample, quant_int_log10, fill = time)) +
+  geom_boxplot() +
+  theme(axis.text.x= element_text(angle = 90, vjust = 1, hjust=1 ,size = 7)) +
+  ggtitle(paste0(title)) 
+plot(plt_box)
+
+# Boxplot after normalization 
+title <- "After normalization: Box plot of log10"
+plt_box <- ggplot(result_table %>% filter(sample %in% s), aes(sample, scale_log10, fill = time)) +
+  geom_boxplot() +
+  theme(axis.text.x= element_text(angle = 90, vjust = 1, hjust=1 ,size = 7)) + 
+  ggtitle(paste0(title)) 
+plot(plt_box)
+
+ 
+
+```
+
+Histograms to see how imputation affects distribution: 
+```{r plot4, echo=TRUE, fig.height=6, fig.width=8}
+
+  title <- "Without imputation: log10 protein intensities"
+  plt_hist <- ggplot(result_table %>% filter(sample %in% s, Imputed == FALSE), aes(x = scale_log10)) +
+    geom_histogram(bins = 60) +
+    facet_wrap(~ sample) +
+    ggtitle(paste0(title))
+  plot(plt_hist)
+
+  title <- "With imputation: log10 protein intensities"
+  plt_hist <- ggplot(result_table %>% filter(sample %in% s), aes(x = scale_log10, fill = as.factor(Imputed))) +
+    geom_histogram(bins = 60) +
+     
+    facet_wrap(~ sample) +
+    ggtitle(paste0(title))
+  plot(plt_hist)
+
+
+```
+QQ-plots to see how imputed values affect normal distribution:
+
+```{r plot5, echo=TRUE, fig.height=6, fig.width=8}
+
+
+  # qq-plots of sample of samples 
+  title <- "Before imputation: QQ-plot of samples"
+  plt_qq <- ggplot(result_table %>% filter(sample %in% s, Imputed == FALSE),aes( sample = scale_log10,  ), na.rm = T) +
+    geom_qq() +
+    facet_wrap(~ sample) +
+    ggtitle(paste0(title))
+  plot(plt_qq)
+
+  title <- "After imputation : QQ-plot of samples"
+  plt_qq <- ggplot(result_table %>% filter(sample %in% s),aes( sample = scale_log10  ), na.rm = T) +
+    geom_qq() +
+    facet_wrap(~ sample) +
+    ggtitle(paste0(title))
+  plot(plt_qq)
+
+
+``` 
+

@@ -1,0 +1,892 @@
+---
+title: | 
+  | Section: 
+  | EPIC arrays: clustering based on methylation data
+output:
+  bookdown::html_document2:
+    theme: journal
+    highlight: kate
+    df_print: paged
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+    code_folding: hide
+    css: "style.css"
+date: "`r format(Sys.time(), '%d %B, %Y')`"    
+bibliography: references.bib 
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r knitr, include=FALSE}
+# knitr
+knitr::opts_chunk$set(echo = TRUE, 
+                      collapse = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      cache = FALSE, 
+                      cache.path = "../cache/", 
+                      fig.height = 5, 
+                      fig.width = 6,
+                      eval=TRUE)
+```
+
+```{r setup, eval=TRUE}
+# R env
+rm(list=ls())
+#source("renv/activate.R")
+
+library(RColorBrewer)
+library(tidyverse)
+library(magrittr)
+library(cluster)
+library(cluster.datasets)
+library(cowplot)
+library(NbClust)
+library(clValid)
+library(ggfortify)
+library(clustree) 
+library(dendextend)
+library(factoextra)
+library(FactoMineR)
+library(corrplot)
+library(GGally)
+library(ggiraphExtra)
+library(knitr)
+library(kableExtra)
+library(plotly)
+library(RankAggreg)
+library(DT)
+library(ggVennDiagram)
+library(rstatix)
+
+color.points  = "#337ab7"
+dir.tables <- "../results/tables/"
+dir.out <- "../results/EPIC-arrays/"
+run.label <- "EPIC-clustering-methylation"
+mycolors <- brewer.pal(4, "Set1")
+
+```
+
+# Aim
+- To use unsupervised PCA and clustering method on methylation data to examine data structure. 
+- Specifically, to check if we can characterize "always present" on the PCA scores plot an outlying group of samples. 
+
+```{r read-in-data, eval=T}
+# load R data
+load("../results/EPIC-arrays/ChAMP/epic-arrays-train-test.RData")
+
+# load summary statistics per probe
+data.stats <- read_tsv("../results/EPIC-arrays/EPIC-eda-allstats.txt")
+
+# read-in cluster solutions based on clinical data
+clusters.clin.train <- read_tsv("../results/tables/clusters-clinical-train.txt")
+clusters.clin.test <- read_tsv("../results/tables/clusters-clinical-test.txt")
+
+```
+
+```{r clean-loaded-data, eval=T}
+# prepare clinical data 
+data.samples_cln <- data.samples %>%
+  rename(CD25 = `CD25.score.diagnosis`, 
+         CD25_1year = `CD25.1.year`, 
+         Group = Sample_Group, 
+         BMI = `BMI.1.year`,
+         screen_diagn = screening_diagn,
+         menstat = `INCA2_a_pat_mensstat_Beskrivning..A.`)
+
+# annotation data
+m.annotate <- data.annotate
+m.annotateAttr <- data.annotateAttr
+
+# train and test methylation data 
+data.combat <- data.combat_methdate_array
+colnames(data.combat) <- data.samples_cln$SCANB
+
+idx.train <- inds$train
+idx.test <- inds$test
+data.train <- data.combat[, idx.train]
+data.test <- data.combat[, idx.test]
+
+# train and test clinical data
+samples.train <- data.samples_cln[idx.train, ]
+samples.test <- data.samples_cln[idx.test, ]
+
+```
+
+```{r filter-features, eval=T}
+
+# filtering based on CV and IQR
+# decided upon looking at various statistics and thresholds in conjunction with box plots
+cpgs <- data.stats %>% 
+  filter(cv >= quantile(data.stats$cv, probs = c(0, 0.25, 0.5, 0.75, 0.9, 1))[4] |
+                        IQR >= quantile(data.stats$IQR)[4]) %>% pull(CpG)
+
+```
+
+
+# PCA (train) {.tabset}
+```{r pca-input, echo=F}
+
+# input data for PCA
+data.org <- data.train[cpgs,]
+samples.org <- samples.train
+
+# transpose and scale data (scaling not needed here as beta values are between 0 and 1)
+data.scaled <- t(data.org)
+
+```
+
+```{r run-pca, echo=F, eval=F}
+# do PCA
+res.pca <- PCA(data.scaled, graph = F)
+file.save <- paste(dir.out, "PCA-train.RData", sep = "")
+save(res.pca, file=file.save)
+
+```
+
+```{r load-pca, echo=F}
+# re-load PCA object
+file.save <- paste(dir.out, "PCA-train.RData", sep = "")
+load(file.save)
+```
+
+## PC1 vs. PC2
+```{r pca-scores12, fig.cap = "PCA scores plot based on the methylation data"}
+
+# scores plot (interactive)
+pca.frame <- data.frame(PC1 = round(res.pca$ind$coord[,1], 2), 
+                        PC2 = round(res.pca$ind$coord[,2], 2), 
+                        PC3 = round(res.pca$ind$coord[,3], 2), 
+                        PC4 = round(res.pca$ind$coord[,4], 2),
+                        PC5 = round(res.pca$ind$coord[,5], 2),
+                        group = factor(samples.org$Group, labels = c("Low", "High")),
+                        SCANB = samples.org$SCANB)
+
+  
+pca.var <- res.pca$eig[,3] %>%
+  round(2)
+  
+plot.pca12 <- ggplot(pca.frame, aes(PC1, PC2, color = group, text = SCANB)) + 
+  geom_point(size=2, alpha = 0.6) + 
+  scale_colour_brewer(palette = "Set1") + 
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) + 
+  theme_bw() + 
+  theme(legend.title = element_blank())
+  
+ggplotly(plot.pca12)
+
+```
+
+## PC1 vs. PC2 (alt)
+```{r pca-scores12-alt, fig.width=8, fig.height=8, fig.cap = "PCA scores plot based on the methylation data (alternative version)"}
+
+fviz_pca_ind(res.pca, 
+             col.ind = "black",
+             repel = TRUE)
+
+```
+
+## PC2 vs. PC3
+```{r pca-scores23, fig.cap = "PCA scores plot based on the methylation data"}
+
+plot.pca23 <- ggplot(pca.frame, aes(PC2, PC3, color = group, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  ylab(paste("PC3: ", pca.var[3], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca23)
+
+```
+
+## Screeplot
+```{r screeplot, fig.cap = "Percentage of variance explained by principal components", echo=T}
+
+# How many components for 75% variance
+fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 50), barcolor = color.points)
+print("Number of components needed to explain 75% variance: ")
+print(which(res.pca$eig[,3] >= 75)[1])
+
+print("Number of components needed to explain 95% variance: ")
+print(which(res.pca$eig[,3] >= 95)[1])
+
+```
+
+## Loadings 1
+```{r load1, fig.keep='all', fig.cap = c("Contribution of variables to PC1: top 15", "Contribution of variables to PC1: top 1000 profile")}
+# extract the results for variables
+var <- get_pca_var(res.pca)
+
+# contributions of variables to PC1
+fviz_contrib(res.pca, choice = "var", axes = 1, top = 15, barcolor = color.points)
+
+contr <- res.pca$var$contrib
+plot(sort(contr[,1], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+
+```
+
+## Loadings 2
+```{r load2, fig.keep='all', fig.cap = c("Contribution of variables to PC2: top 15", "Contribution of variables to PC2: top 1000 profile")}
+# contributions of variables to PC2
+fviz_contrib(res.pca, choice = "var", axes = 2, top = 15, barcolor = color.points)
+plot(sort(contr[,2], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+```
+
+## Loadings 3
+```{r load3, fig.keep='all', fig.cap = c("Contribution of variables to PC3: top 15", "Contribution of variables to PC3: top 1000 profile")}
+# contributions of variables to PC3
+fviz_contrib(res.pca, choice = "var", axes = 3, top = 15, barcolor = color.points)
+plot(sort(contr[,3], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+```
+
+
+# Clustering (train) {.tabset}
+
+- A common aspect of performing clustering is deciding on a clustering algorithm such as based on hierarchical clustering or partition method and finding the optimal number of cluster. Here, we use package `clValid` to systematically test four algorithm (hierarchical clustering, k-means clustering, partitioning around medoids (pam) and clustering large applications (CLARA) and number of clusters ranging from 2 to 8). 
+- `clValid` [@Brock2008] incorporates a set of **internal and stability validation measures**. 
+- For internal validation, it uses measures that reflect the compactness, connectedness, and separation of the cluster partitions. Connectedness relates to what extent observations are placed in the same cluster as their nearest neighbors in the data space, and is here measured by the **connectivity**. Compactness assesses cluster homogeneity, usually by looking at the intra-cluster variance, while separation quantifies the degree of separation between clusters (usually by measuring the distance between cluster centroids). Since compactness and separation demonstrate opposing trends (compactness increases with the number of clusters but separation decreases), popular methods combine the two measures into a single score. The **Dunn Index** and **Silhouette Width**  are both examples of non-linear combinations of the compactness and separation, and with the connectivity comprise the three internal measures available in `clValid`. 
+- The stability measures compare the results from clustering based on the full data to clustering based on removing each column, one at a time. These measures work especially well if the data are highly correlated, which is often the case in high-throughput genomic data. The included measures are the average proportion of non-overlap (APN), the average distance (AD), the average distance between means (ADM), and the figure of merit (FOM). In all cases the average is taken over all the deleted columns, and all stability measures should be minimized.
+- More about the validation measures can be found [https://cran.r-project.org/web/packages/clValid/vignettes/clValid.pdf](https://cran.r-project.org/web/packages/clValid/vignettes/clValid.pdf)
+
+```{r run-clValid, echo=F, eval=F}
+
+# NOTE: technically not feasible to run validation metric on the current local computer
+# find best number of clusters and best method
+# result <- clValid(data.scaled,
+#                   nClust = 2:8,
+#                   clMethods = c("hierarchical", "kmeans", "pam", "clara"),
+#                   validation = c("internal","stability"), 
+#                   verbose  = TRUE)
+
+cls.result <- clValid(data.scaled,
+                  nClust = 2:8,
+                  clMethods = c("hierarchical", "kmeans", "pam", "clara"),
+                  validation = c("internal"), 
+                  verbose  = TRUE)
+# extract ranks
+res <- getRanksWeights(cls.result)
+
+# save to RData
+file.save <- paste(dir.out, "clValid-train.RData", sep="")
+save(res, file=file.save)
+
+```
+
+```{r load-clValid, echo=F}
+# reload clValid ranks
+file.save <- paste(dir.out, "clValid-train.RData", sep="")
+load(file.save)
+
+```
+
+
+```{r show-best-cls-ranks, fig.keep='all', fig.cap = c("Top clustering methods and number of clusters as assessed by seven internal and stability measures (top 3 ranks). APN: Average Proportion of Non-overlap, AD: Average Distance, ADM: Average Distance between Means, FOM: Figure of Merit, Dunn: Dunn Index, Silhouette: Silhouette Width. APN, AD, ADM, FOM should be minimized", "Top three clustering methods together with optimal number of cluster selected by aggregrated ranking"), eval=T}
+
+# top 3 ranks
+datatable(res$ranks[,1:3])
+
+# rank aggregation
+cl.aggr <- RankAggreg(x=res$ranks, k=3, weights=res$weights, seed=123, verbose=FALSE)
+cl.top <- data.frame(top = cl.aggr$top.list)
+datatable(cl.top)
+```
+
+## hierarchical-3 (Cluster plot)
+```{r run-best-cls, echo=F, eval=F}
+
+# run best clustering method, here hcl with 3 clusters
+# Note: not interesting for running for two clusters only
+
+k.best = 3
+set.seed(1)
+d <- dist(data.scaled, method = "euclidean")
+res.hc <- hclust(d, method = "ward.D2")
+res.hc.final <- cutree(res.hc, k = k.best)
+
+file.save = paste(dir.out, "hclust-k3.RData")
+save(res.hc, res.hc.final, file=file.save)
+
+```
+
+```{r reload-best-cls, echo=F}
+
+# reload results of the best clustering method
+file.save = paste(dir.out, "hclust-k3.RData")
+load(file.save)
+final <- res.hc.final
+
+```
+
+```{r hcl3-finaldata}
+
+df <- as.data.frame(final) %>%
+  rownames_to_column("Sample") %>%
+  as_tibble() %>%
+  rename(cluster_meth = final)
+
+cluster.meth.train <- df
+
+```
+
+```{r hcl3-pca, fig.cap = "PCA scores plot based on the methylation data: color-coded according to the cluster solutions"}
+pca.frame_exp <- pca.frame %>% as_tibble() %>%
+  left_join(df, by = c("SCANB" = "Sample")) %>%
+  mutate(cluster_meth = factor(cluster_meth)) %>%
+  left_join(clusters.clin.train) %>%
+  mutate(cluster = factor(cluster)) %>%
+  as_tibble()
+
+plot.pca12 <- ggplot(pca.frame_exp, aes(PC1, PC2, color = cluster_meth, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) +
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca12)
+
+```
+
+```{r hcl3-pca-clincial, fig.cap = "PCA scores plot based on the methylation data: color-coded according to the cluster solutions based on the clinical parameters"}
+pca.frame_exp <- pca.frame %>% as_tibble() %>%
+  left_join(df, by = c("SCANB" = "Sample")) %>%
+  mutate(cluster_meth = factor(cluster_meth)) %>%
+  left_join(clusters.clin.train) %>%
+  mutate(cluster = factor(cluster)) %>%
+  as_tibble()
+
+frame.train <- pca.frame_exp
+
+plot.pca12 <- ggplot(pca.frame_exp, aes(PC1, PC2, color = cluster, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) +
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca12)
+
+```
+
+
+```{r compare-outlying, echo=F}
+# compare "outlying clusters"
+
+outlying.clin <- pca.frame_exp %>%
+  filter(cluster == 1) %>%
+  pull(SCANB)
+
+outlying.meth <- pca.frame_exp %>%
+  filter(cluster_meth == 3) %>%
+  pull(SCANB)
+
+outlying.common <- intersect(outlying.clin, outlying.meth)
+
+```
+
+Samples in common between the "outlying" cluster based on the clinical parameters (cluster 1) and "outlying" cluster based on methylation data (cluster 3) are: `r outlying.common`
+
+
+## hierarchical-3 (Group statistics: numerical)
+```{r, fig.keep="all", fig.cap=c("Summary statstiics of the numerical clinical variables stratified by the cluster solutions based on the methylation data", "Pairwise t-test results for the clinical variables stratified by the cluster solutions based on the methylation data")}
+
+# summary statistics for numerical data
+pca.frame_exp %>%
+  group_by(cluster_meth) %>%
+  get_summary_stats(Age, CD25, BMI, CD25_1year) %>% 
+  arrange(variable) %>%
+  datatable()
+
+# t-test test between the clusters for each numerical variable
+pca.frame_exp %>%
+  select("Age", "CD25", "BMI", "CD25_1year", "cluster_meth") %>%
+  pivot_longer(-cluster_meth, names_to = "variable") %>%
+  group_by(variable) %>%
+  t_test(value ~ cluster_meth) %>%
+  select(-".y.") %>%
+  mutate(statistic = round(statistic,2)) %>%
+  mutate(df = round(df,2)) %>%
+  datatable()
+
+```
+
+## hierarchical-3 (Group statistics: categorical)
+```{r}
+
+fvar <- c("Group", "Exercise", "Smoking", "screen_diagn", "menstat", "Treat", "metastasis", "Node", "Tumor", "Surgery", "cluster_meth")
+
+# proportion table
+pca.frame_exp %>% 
+  select(fvar) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate_if(is.double, as.factor) %>% 
+  pivot_longer(-cluster_meth, names_to = "variable") %>% 
+  count(cluster_meth, variable, value) %>% 
+  group_by(variable, cluster_meth) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  arrange(variable) %>% 
+  mutate(prop = round(prop, 2)) %>%
+  datatable()
+
+```
+
+
+```{r, fig.cap = "Chi-square statsitics comparing clinical categorical data for difference between the identified clusters"}
+
+# Chi-square test per variable
+
+fvar.check <- c("Exercise", "Smoking", "screen_diagn", "menstat", "Treat", "Node", "Tumor", "Surgery")
+
+table.chisquare <- matrix(data = NA, nrow = length(fvar.check), ncol = 6)
+colnames(table.chisquare) <- c("n", "statistic", "p", "df", "method", "p.signif")
+table.chisquare <- data.frame(table.chisquare)
+
+for (i in seq_along(fvar.check)){
+  
+  print(paste("Variable: ", fvar.check[i], sep = ""))
+  
+  # create xtab
+  xtab <- pca.frame_exp %>% select(cluster_meth, fvar.check[i]) %>% 
+    table()
+  
+  # calculate xtab.prop proportions
+  rowsum <- apply(xtab, 1, sum)
+  xtab.prop <- round(xtab / rowsum, 2)
+  print("Proportion table:")
+  print(xtab.prop)
+  
+  # chi-square test
+  tmp.test <- chisq_test(xtab, simulate.p.value = TRUE)
+  table.chisquare[i,] <- as.data.frame(tmp.test)
+  
+  print("chi-square: ")
+  print(tmp.test)
+
+}
+
+
+df.chi <- data.frame(variable = fvar.check, table.chisquare)
+df.chi %>% mutate(p.adj = p.adjust(p)) %>%
+  select(-p.signif, -df) %>%
+  mutate(statistic = round(statistic, 2)) %>%
+  datatable()
+
+```
+
+# PCA (test) {.tabset}
+```{r pca-input-test, echo=F}
+
+# input data for PCA
+data.org <- data.test[cpgs,]
+samples.org <- samples.test
+
+# transpose and scale data (scaling not needed here as beta values are between 0 and 1)
+data.scaled <- t(data.org)
+
+```
+
+```{r run-pca-test, echo=F, eval=F}
+# do PCA
+res.pca <- PCA(data.scaled, graph = F)
+file.save <- paste(dir.out, "PCA-test.RData", sep = "")
+save(res.pca, file=file.save)
+
+```
+
+```{r load-pca-test, echo=F}
+# re-load PCA object
+file.save <- paste(dir.out, "PCA-test.RData", sep = "")
+load(file.save)
+```
+
+## PC1 vs. PC2
+```{r pca-scores12-test, fig.cap = "PCA scores plot based on the methylation data"}
+
+# scores plot (interactive)
+pca.frame <- data.frame(PC1 = round(res.pca$ind$coord[,1], 2), 
+                        PC2 = round(res.pca$ind$coord[,2], 2), 
+                        PC3 = round(res.pca$ind$coord[,3], 2), 
+                        PC4 = round(res.pca$ind$coord[,4], 2),
+                        PC5 = round(res.pca$ind$coord[,5], 2),
+                        group = factor(samples.org$Group, labels = c("Low", "High")),
+                        SCANB = samples.org$SCANB)
+
+  
+pca.var <- res.pca$eig[,3] %>%
+  round(2)
+  
+plot.pca12 <- ggplot(pca.frame, aes(PC1, PC2, color = group, text = SCANB)) + 
+  geom_point(size=2, alpha = 0.6) + 
+  scale_colour_brewer(palette = "Set1") + 
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) + 
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) + 
+  theme_bw() + 
+  theme(legend.title = element_blank())
+  
+ggplotly(plot.pca12)
+
+```
+
+## PC1 vs. PC2 (alt)
+```{r pca-scores12-alt-test, fig.width=8, fig.height=8, fig.cap = "PCA scores plot based on the methylation data (alternative version)"}
+
+fviz_pca_ind(res.pca, 
+             col.ind = "black",
+             repel = TRUE)
+
+```
+
+## PC2 vs. PC3
+```{r pca-scores23-test, fig.cap = "PCA scores plot based on the methylation data"}
+
+plot.pca23 <- ggplot(pca.frame, aes(PC2, PC3, color = group, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  ylab(paste("PC3: ", pca.var[3], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca23)
+
+```
+
+## Screeplot
+```{r screeplot-test, fig.cap = "Percentage of variance explained by principal components", echo=T}
+
+# How many components for 75% variance
+fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 50), barcolor = color.points)
+print("Number of components needed to explain 75% variance: ")
+print(which(res.pca$eig[,3] >= 75)[1])
+
+print("Number of components needed to explain 95% variance: ")
+print(which(res.pca$eig[,3] >= 95)[1])
+
+```
+
+## Loadings 1
+```{r load1-test, fig.keep='all', fig.cap = c("Contribution of variables to PC1: top 15", "Contribution of variables to PC1: top 1000 profile")}
+# extract the results for variables
+var <- get_pca_var(res.pca)
+
+# contributions of variables to PC1
+fviz_contrib(res.pca, choice = "var", axes = 1, top = 15, barcolor = color.points)
+
+contr <- res.pca$var$contrib
+plot(sort(contr[,1], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+
+```
+
+## Loadings 2
+```{r load2-test, fig.keep='all', fig.cap = c("Contribution of variables to PC2: top 15", "Contribution of variables to PC2: top 1000 profile")}
+# contributions of variables to PC2
+fviz_contrib(res.pca, choice = "var", axes = 2, top = 15, barcolor = color.points)
+plot(sort(contr[,2], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+```
+
+## Loadings 3
+```{r load3-test, fig.keep='all', fig.cap = c("Contribution of variables to PC3: top 15", "Contribution of variables to PC3: top 1000 profile")}
+# contributions of variables to PC3
+fviz_contrib(res.pca, choice = "var", axes = 3, top = 15, barcolor = color.points)
+plot(sort(contr[,3], decreasing = T)[1:1000], type = "l", ylab="Contributions (%)", xlab = "Variable")
+```
+
+
+# Clustering (test) {.tabset}
+
+```{r run-clValid-test, echo=F, eval=F}
+
+cls.result <- clValid(data.scaled,
+                  nClust = 2:8,
+                  clMethods = c("hierarchical", "kmeans", "pam", "clara"),
+                  validation = c("internal"), 
+                  verbose  = TRUE)
+# extract ranks
+res <- getRanksWeights(cls.result)
+
+# save to RData
+file.save <- paste(dir.out, "clValid-test.RData", sep="")
+save(res, file=file.save)
+
+```
+
+```{r load-clValid-test, echo=F}
+# reload clValid ranks
+file.save <- paste(dir.out, "clValid-test.RData", sep="")
+load(file.save)
+
+```
+
+
+```{r show-best-cls-ranks-test, fig.keep='all', fig.cap = c("Top clustering methods and number of clusters as assessed by seven internal and stability measures (top 3 ranks). APN: Average Proportion of Non-overlap, AD: Average Distance, ADM: Average Distance between Means, FOM: Figure of Merit, Dunn: Dunn Index, Silhouette: Silhouette Width. APN, AD, ADM, FOM should be minimized", "Top three clustering methods together with optimal number of cluster selected by aggregrated ranking"), eval=T}
+
+# top 3 ranks
+datatable(res$ranks[,1:3])
+
+# rank aggregation
+cl.aggr <- RankAggreg(x=res$ranks, k=3, weights=res$weights, seed=123, verbose=FALSE)
+cl.top <- data.frame(top = cl.aggr$top.list)
+datatable(cl.top)
+```
+
+## hierarchical-3 (Cluster plot)
+```{r run-best-cls-test, echo=F, eval=F}
+
+# run best clustering method, here hcl with 3 clusters
+# Note: not interesting for running for two clusters only
+
+k.best = 3
+set.seed(1)
+d <- dist(data.scaled, method = "euclidean")
+res.hc <- hclust(d, method = "ward.D2")
+res.hc.final <- cutree(res.hc, k = k.best)
+
+file.save = paste(dir.out, "hclust-k3-test.RData")
+save(res.hc, res.hc.final, file=file.save)
+
+```
+
+```{r reload-best-cls-test, echo=F}
+
+# reload results of the best clustering method
+file.save = paste(dir.out, "hclust-k3-test.RData")
+load(file.save)
+final <- res.hc.final
+
+```
+
+```{r hcl3-finaldata-test}
+
+df <- as.data.frame(final) %>%
+  rownames_to_column("Sample") %>%
+  as_tibble() %>%
+  rename(cluster_meth = final)
+
+cluster.meth.test <- df
+
+```
+
+```{r hcl3-pca-test, fig.cap = "PCA scores plot based on the methylation data: color-coded according to the cluster solutions"}
+pca.frame_exp <- pca.frame %>% as_tibble() %>%
+  left_join(df, by = c("SCANB" = "Sample")) %>%
+  mutate(cluster_meth = factor(cluster_meth)) %>%
+  left_join(clusters.clin.train) %>%
+  mutate(cluster = factor(cluster)) %>%
+  as_tibble()
+
+frame.test <- pca.frame_exp
+
+plot.pca12 <- ggplot(pca.frame_exp, aes(PC1, PC2, color = cluster_meth, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) +
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca12)
+
+```
+
+```{r hcl3-pca-clincal-test, fig.cap = "PCA scores plot based on the methylation data: color-coded according to the cluster solutions based on the clinical parameters"}
+pca.frame_exp <- pca.frame %>% as_tibble() %>%
+  left_join(df, by = c("SCANB" = "Sample")) %>% 
+  mutate(cluster_meth = factor(cluster_meth)) %>% 
+  left_join(clusters.clin.test, by = c("SCANB" = "SCANB")) %>%
+  mutate(cluster = factor(cluster)) %>%
+  as_tibble()
+
+plot.pca12 <- ggplot(pca.frame_exp, aes(PC1, PC2, color = cluster, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  xlab(paste("PC1: ", pca.var[1], "% variance", sep="")) +
+  ylab(paste("PC2: ", pca.var[2], "% variance", sep="")) +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot.pca12)
+
+```
+
+
+## hierarchical-3 (Group statistics: numerical)
+```{r, fig.keep="all", fig.cap=c("Summary statstiics of the numerical clinical variables stratified by the cluster solutions based on the methylation data", "Pairwise t-test results for the clinical variables stratified by the cluster solutions based on the methylation data")}
+
+# summary statistics for numerical data
+pca.frame_exp %>%
+  group_by(cluster_meth) %>%
+  get_summary_stats(Age, CD25, BMI, CD25_1year) %>% 
+  arrange(variable) %>%
+  datatable()
+
+# t-test test between the clusters for each numerical variable
+pca.frame_exp %>%
+  select("Age", "CD25", "BMI", "CD25_1year", "cluster_meth") %>%
+  pivot_longer(-cluster_meth, names_to = "variable") %>%
+  group_by(variable) %>%
+  t_test(value ~ cluster_meth) %>%
+  select(-".y.") %>%
+  mutate(statistic = round(statistic,2)) %>%
+  mutate(df = round(df,2)) %>%
+  datatable()
+
+```
+
+## hierarchical-3 (Group statistics: categorical)
+```{r}
+
+fvar <- c("Group", "Exercise", "Smoking", "screen_diagn", "menstat", "Treat", "metastasis", "Node", "Tumor", "Surgery", "cluster_meth")
+
+# proportion table
+pca.frame_exp %>% 
+  select(fvar) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate_if(is.double, as.factor) %>% 
+  pivot_longer(-cluster_meth, names_to = "variable") %>% 
+  count(cluster_meth, variable, value) %>% 
+  group_by(variable, cluster_meth) %>% 
+  mutate(prop = prop.table(n)) %>% 
+  arrange(variable) %>% 
+  mutate(prop = round(prop, 2)) %>%
+  datatable()
+
+```
+
+```{r, fig.cap = "Chi-square statsitics comparing clinical categorical data for difference between the identified clusters"}
+
+# Chi-square test per variable
+
+fvar.check <- c("Exercise", "Smoking", "screen_diagn", "menstat", "Treat", "Node", "Tumor", "Surgery")
+
+table.chisquare <- matrix(data = NA, nrow = length(fvar.check), ncol = 6)
+colnames(table.chisquare) <- c("n", "statistic", "p", "df", "method", "p.signif")
+table.chisquare <- data.frame(table.chisquare)
+
+for (i in seq_along(fvar.check)){
+  
+  print(paste("Variable: ", fvar.check[i], sep = ""))
+  
+  # create xtab
+  xtab <- pca.frame_exp %>% select(cluster_meth, fvar.check[i]) %>% 
+    table()
+  
+  # calculate xtab.prop proportions
+  rowsum <- apply(xtab, 1, sum)
+  xtab.prop <- round(xtab / rowsum, 2)
+  print("Proportion table:")
+  print(xtab.prop)
+  
+  # chi-square test
+  tmp.test <- chisq_test(xtab, simulate.p.value = TRUE)
+  table.chisquare[i,] <- as.data.frame(tmp.test)
+  
+  print("chi-square: ")
+  print(tmp.test)
+
+}
+
+df.chi <- data.frame(variable = fvar.check, table.chisquare)
+df.chi %>% mutate(p.adj = p.adjust(p)) %>%
+  select(-p.signif, -df) %>%
+  mutate(statistic = round(statistic, 2)) %>%
+  datatable()
+
+
+```
+
+# Compare to clustering based on microRNAs {.tabset}
+
+```{r}
+# read-in data
+data.microrna <- read.delim("../data/dataGG_PCAnorm_ext.txt", sep=" ")
+clust.microarna <- as_tibble(data.microrna)
+
+```
+
+## train 
+```{r, fig.keep='all', fig.cap = c("PCA scores plot based on the clinical paramteres (test) with overlaid cluster solutions from microRNAs analyses: PC1 vs. PC2", "PCA scores plot based on the clinical paramteres (train) with overlaid cluster solutions from microRNAs analyses: PC2 vs. PC3")}
+
+frame.inp <- frame.train
+
+frame.microrna <- clust.microarna %>%
+  select(-PC1, -PC2, -Group, -Scan_date, -Plate) %>%
+  as_tibble() %>%
+  rename(cluster_micoRNA = Cluster)
+
+frame.plot <- frame.inp %>%
+  left_join(frame.microrna, by = c("SCANB" = "Sample")) 
+
+plot12 <- frame.plot %>% ggplot(aes(PC1, PC2, color = cluster_micoRNA, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot12)
+
+plot23 <- frame.plot %>% ggplot(aes(PC2, PC3, color = cluster_micoRNA, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot23)
+
+```
+
+
+## test
+```{r, fig.keep='all', fig.cap = c("PCA scores plot based on the clinical paramteres (test) with overlaid cluster solutions from microRNAs analyses: PC1 vs. PC2", "PCA scores plot based on the clinical paramteres (train) with overlaid cluster solutions from microRNAs analyses: PC2 vs. PC3")}
+
+frame.inp <- frame.test
+
+frame.microrna <- clust.microarna %>%
+  select(-PC1, -PC2, -Group, -Scan_date, -Plate) %>%
+  as_tibble() %>%
+  rename(cluster_micoRNA = Cluster)
+
+frame.plot <- frame.inp %>%
+  left_join(frame.microrna, by = c("SCANB" = "Sample")) 
+
+plot12 <- frame.plot %>% ggplot(aes(PC1, PC2, color = cluster_micoRNA, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot12)
+
+plot23 <- frame.plot %>% ggplot(aes(PC2, PC3, color = cluster_micoRNA, text = SCANB)) +
+  geom_point(size=2, alpha = 0.6) +
+  scale_colour_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(legend.title = element_blank())
+
+ggplotly(plot23)
+
+```
+
+
+# Conclusions
+- Trying various clustering algorithms and number of clusters between 2 and 8 showed that methylation data is best divided into two subgroups by hierarchical clustering with the second best partition consisting of three subgroups, also with hierarchical clustering. 
+- Since we were interested in characterizing the "outlying" group of samples that we have seen before on various PCA scores plots the hierarchical clustering with 3 sub-groups was investigated in detail. 
+- Overall, it was not easy to find a clear link between the clusters based on the methylation data and the clinical parameters. 
+- Overlaying the clusters found given the clinical parameters did not result in a clear match with the cluster based on the methylation data. 
+- Assessing the potential relationships the other way around, i.e. comparing clinical variables given clusters found on the methylation data show a potential difference between the clusters when looking at the Exercise variable. Although there was, albeit smaller, difference in Exercise between the clusters given the test set, the proportions profile did not match between train and test data. 
+- Finally, initial comparison of the "outlying" cluster with the one outlying in based on microRNA has shown no match.
+- Overall, given the available clinical parameters it is not straightforward to explain the "outlying" group via the clinical data. 
+- It may be interesting to check the two clusters solutions in light of clinical data, although that would not help to eliminate some samples from the down-stream machine learning methods. 
+- Another additional analysis could be to look at the methylation probes profile, to understand which may be driving the separation between the clusters. This again, would not help the down-stream machine learning analyses, but could be an interesting finding if anything were to come up. 
+
+# References {-}
+<div id="refs"></div>
+
+
