@@ -45,11 +45,11 @@ The main aim of the analyses is to QC the protein data and identify any outlier 
 
  
 
-## QC of data
+# QC of data
 
 ```{r setup1, echo=FALSE ,include=FALSE}
 # import libraries and data
-renv::init()
+#renv::init()
 library(tidyverse)
 library(reshape2)
 library(magrittr)
@@ -62,7 +62,9 @@ library(factoextra)
 library(FactoMineR)
 library(mice)
 library(SummarizedExperiment)
-
+#renv::install("stemangiola/tidySummarizedExperiment")
+library(xlsx)
+library(tidySummarizedExperiment)
 
 library(RColorBrewer)
 library(GGally)
@@ -73,77 +75,110 @@ library(plotly)
 library(RankAggreg)
 library(DT)
 library(ggVennDiagram)
+getwd()
+
+source("./code/functions.R")
 ```
 
 
 ```{r setup1, echo=FALSE ,include=FALSE}
-nn_sp_report <- read_tsv("../20210411_125835_Niklas N direct DIA_Report.xls", 
-                       col_names = TRUE
-                        )
+data <- list()
+data$raw_data <- read_excel( "./data/rawdata/Ovarian_cancer_data.xlsx", sheet = 1   ) |> as_matrix()
 
-sample_prep <- readxl::read_xlsx("../2021-03-05 Niklas Niehlsen with sample preparation dates.xlsx")
-sample_clin <- readxl::read_xlsx("../Region.Skane.TTM1.Biobank_Chsoen_for_currentanalysis.xlsx") # The clinical data provided. The data contained wrong sample identifiers and one 0 was missing ans well as Malmo samples were coded as MAMO in the clinical data while the label was coded as MAL in the protein data.
-# set seed for imputations
-set.seed(20210527)
+#rownames(data$raw_data) <- data$raw_data$Protein.Group
 
-head(nn_sp_report)
-```
+data$sample_prep <-  read_excel( "./data/rawdata/Ovarian_cancer_data.xlsx", sheet = 2   ) %>% 
+                    set_rownames(.$Sample_ID) |>  
+                    as.data.frame()
 
-```{r}
-#nn_sp_report_unq_pep <- '.*?PG.Quantity'
-nn_sp_report_un_pep <- nn_sp_report %>% distinct(PG.ProteinGroups,.keep_all = TRUE) %>% ungroup() # remove repeated values. The peptide level data is not provided, instead protein intensity was repeated for each protein.
+data$sample_clin <-  read_excel( "./data/rawdata/Ovarian_cancer_data.xlsx", sheet = 3   ) 
 
-nn_sp_report_un_pep <- nn_sp_report_un_pep %>% mutate(ID = str_split(PG.ProteinGroups, simplify = TRUE, pattern = ";")[,1], .before=1) # Add protein ID column (First in the protein list)
+## Remove the duplicated rows
 
-nn_sp_report_un_pept <- nn_sp_report_un_pep %>% select(contains(c("ID",'PG.Quantity'))) # Select the columns containing protein quantity
+data$sample_clin <- data$sample_clin |> distinct(Sample_ID, .keep_all = TRUE)
 
-### Prepare the sample meta data by combining sample preparation sheet, annotations extracted from the protein column names and the clinical data provided. 
-samples <- colnames(nn_sp_report_un_pept)[-1] # 
-col_data <- data.frame(time = str_match(samples, "-[0-9]{2}-"),  sample =  str_split(str_split(samples, ".htrms.", simplify = TRUE)[,1], pattern = " ", simplify = TRUE)[,2] )
-col_data <- col_data %>%  mutate(screening_number = str_sub(sample, start = 1, end = 9)  )
 
-col_data <- left_join(col_data, sample_prep, by = c("sample"="Sample ID"))
-rownames(col_data) <- col_data$sample
-sample_clin <- as.data.frame(sample_clin[, -1])
-col_data <- left_join(col_data, sample_clin, by= c("screening_number"="screening_number"), copy = TRUE)
-rownames(col_data) <- col_data$sample
+data$row_data <-  read_excel( "./data/rawdata/Ovarian_cancer_data.xlsx", 
+                              sheet = 4   ) %>% 
+                              set_rownames(.$Protein.Group) |> 
+                              as.data.frame()
 
-### Prepare the rowData from the row annotations
-row_data <- nn_sp_report_un_pep[, 1:6]
-rownames(row_data) <- nn_sp_report_un_pept$ID
+## join sample prep sheets
 
-raw_data <- as.matrix(nn_sp_report_un_pept[, samples])
-rownames(raw_data) <- nn_sp_report_un_pept$ID
+data$coldata <- merge(data$sample_prep, data$sample_clin, 
+                      by.x =  "Sample_ID", 
+                      by.y= "Sample_ID", 
+                      all.x=  TRUE, 
+                      all.y=FALSE) %>% 
+                set_rownames(.$Sample_ID) 
 
-raw_data <- matrix(nn_sp_report_un_pept[, samples], dimnames = list(nn_sp_report_un_pept$ID, col_data$sample))
-is.na(raw_data) %>% rowSums()
-row_data <- row_data %>% mutate(ID = str_split(PG.ProteinGroups, simplify = TRUE, pattern = ";")[,1])
-raw_data[is.nan(raw_data)] <- NA
+View(data$coldata)
 
-sumExpObj <- SummarizedExperiment::SummarizedExperiment(assays = list(raw_data = raw_data),
-    colData=col_data,
-    rowData=row_data
+data$raw_data_mat <- as.matrix(data$raw_data[, data$coldata$Sample_ID] |> as.data.frame())
+colnames(data$raw_data_mat) <- data$coldata$Sample_ID
+rownames(data$raw_data_mat) <- data$raw_data$Protein.Group
+#dimnames(data$raw_data_mat) <- list(data$raw_data$Protein.Group, data$coldata$Sample_ID)
+
+sumExpObj<- SummarizedExperiment(assays = list(raw_data = data$raw_data),
+    colData= data$coldata,
+    rowData= data$row_data
 )
-saveRDS(sumExpObj, "../rawaDataSe.rds")
 ```
 
 
-## Analyze missingness 
+```{r setup1, echo=FALSE ,include=FALSE}
+
+sumExpObj_tidy <- sumExpObj |> tidy()
+sumExpObj_tidy
+
+saveRDS(sumExpObj, "./data/sumExpObj.rds") # raw data with sample and row annotations as SummarizedExperiment
+saveRDS(sumExpObj_tidy, "./data/sumExpObj_tidy.rds") # tidy version
+```
+
+
+## Analyze missingness{.tabset}
+
+First samples with missing values greater than 50% were removed from the study
+ - Overall data set and analyses 
+ - Filter proteins in more than 75% samples and the median log intensity below 18
+ - analyses with pehnotype variables
+ 
+Due to samples prepared and run at different time-points, the samples were divided into sample processing batches
+
+ - Filter proteins in more than 75% samples and the median log intensity below 18 in each batch.
+ - Analyse protein relationship with phenotype data.
+
+### Overall data set 
 
 ```{r}
-sumExpObj <- readRDS("../rawaDataSe.rds")
-#setwd("../missing/")
-colData(sumExpObj)
-colData(sumExpObj)$timepoint <- colData(sumExpObj)$time %>% as.factor() %>% as.integer() %>% as.character()
-colnames(sumExpObj) <- paste0(colData(sumExpObj)$screening_number, "_", colData(sumExpObj)$timepoint )
+sumExpObj <- readRDS("./data/sumExpObj.rds") #lo
+sumExpObj_tidy <- readRDS("./data/sumExpObj_tidy.rds")
 
-## Analyze missingness and Impute for PCA etc
-#Data_se <- readRDS("../Data/data_sumExp.rds")
+png("./results/figures/QC/missingSamples.png", res = 300, width = 8000, height = 3000)
+mice_sample <- aggr(assays(sumExpObj)$raw_data, col=c('navyblue','yellow'),
+ numbers=TRUE, sortVars=TRUE,
+ labels=sumExpObj$screening_number, cex.axis=.4,
+ gap=2, ylab=c("Missing data","Pattern"))
+dev.off()
 
-missing <-mice::md.pattern(assays(sumExpObj)$raw_data)
+sumExpObj$nmissing <- mice_sample$missings$Count
+sumExpObj$percent_missing <- (mice_sample$missings$Count/dim(sumExpObj)[1])*100
+sumExpObj_filt
 
-png("../missing/missingProt.png", res = 300, width = 12000, height = 8000)
-mice_prot <- aggr(t(assays(sumExpObj)$raw_data), col=c('navyblue','yellow'),
+sumExpObj_filt <- sumExpObj[ ,sumExpObj$percent_missing < 60]
+sumExpObj_filt <- sumExpObj_filt[, !duplicated(sumExpObj_filt$Sample_ID2) ]
+sumExpObj_filt <- sumExpObj_filt[, -(which(sumExpObj_filt$Sample_ID2 %in% c("PoolDIA_1", "BBkas")))]
+sumExpObj_filt <- sumExpObj_filt[,!(sumExpObj_filt$Sample_ID2=="PoolDIA")]
+
+png("./results/figures/QC/missingSamples_filt.png", res = 300, width = 8000, height = 3000)
+mice_sample <- aggr(assays(sumExpObj_filt)$raw_data, col=c('navyblue','yellow'),
+ numbers=TRUE, sortVars=TRUE,
+ labels=sumExpObj$screening_number, cex.axis=.4,
+ gap=2, ylab=c("Missing data","Pattern"))
+dev.off()
+
+png("./results/figures/QC/missingProt.png", res = 300, width = 12000, height = 8000)
+mice_prot <- aggr(t(assays(sumExpObj_filt)$raw_data), col=c('navyblue','yellow'),
  numbers=TRUE, sortVars=TRUE,
  labels=sumExpObj$screening_number, cex.axis=1,
  gap=1, ylab=c("Missing data","Pattern"))
@@ -151,197 +186,899 @@ dev.off()
 
 mice_prot$missings$Count %>% hist(breaks=200)
 
+rowData(sumExpObj_filt)$nmissing <- mice_prot$missings$Count
+rowData(sumExpObj_filt)$percent_missing <- (mice_prot$missings$Count/dim(sumExpObj_filt)[1])*100
+rowData(sumExpObj_filt)$prot_means <- assays(sumExpObj_filt)$raw_data |> log2() |> rowMeans(na.rm = TRUE)
+rowData(sumExpObj_filt)$prot_median <- assays(sumExpObj_filt)$raw_data |> log2() |> rowMedians(na.rm = TRUE)
 
-png("../missing/missingSamples.png", res = 300, width = 8000, height = 3000)
-mice_sample <- aggr(assays(sumExpObj)$raw_data, col=c('navyblue','yellow'),
- numbers=TRUE, sortVars=TRUE,
- labels=sumExpObj$screening_number, cex.axis=.4,
- gap=2, ylab=c("Missing data","Pattern"))
+png("./results/figures/QC/missingProt_vs_median.png", res = 300, width = 1600, height = 1400)
+ggplot2::ggplot(rowData(sumExpObj_filt) |> as.data.frame(), aes(prot_median, percent_missing )) + geom_point()
 dev.off()
 
-sumExpObj_filt <- sumExpObj[mice_prot$missings[mice_prot$missing$Count <30,]$Variable,]
-
-imp <- mice(assays(sumExpObj_filt)$raw_data, maxit = 0)
-
-predM = imp$predictorMatrix
-meth = imp$method
-set.seed(123)
-imp2 <- mice(assays(sumExpObj_filt)$raw_data, m=3, method = "cart")
-
-imp3 <-  mice::complete(imp2, 1)
-
-assays(sumExpObj_filt)$imputed_raw <- imp3
-
-#saveRDS(sumExpObj_filt, "../data_sumExpfilImp.rds")
-sumExpObj <- readRDS("../data_sumExpfilImp.rds")
+png("./results/figures/QC/missingProt_vs_means.png", res = 300, width = 1600, height = 1400)
+ggplot2::ggplot(rowData(sumExpObj_filt) |> as.data.frame(), aes(prot_means, percent_missing ), ) + geom_point()
+dev.off()
 ```
 
-```{r}
-clin_vars <- c("Batch"  ,"Sample.preparation.date", "time","randomisation_code", "dead24",	"dead48",	"dead72","binarysecout180daycpcscore", "b_age",	"b_sex", "p_ca_to_rosc_min", "a_shock_on_admission", "shockable", "awakeday1",	"awakeday2",	"awakeday3")
-inflam <- c("il6_1",	"il6_2",	"il6_3", "copeptin_1",	"copeptin_2",	"copeptin_3",	"crea_1",	"crea_2",	"crea_3",	"crp_1",	"crp_2",	"crp_3")
-tech_var <- c("Batch"  ,"Sample.preparation.date" )
-colData(sumExpObj)[, clin_vars]
-```
+## Filter based on missing prtein intensity values
 
-
-## PCA
-
-```{r}
-library()
-library("FactoMineR")
-
-res.pca <- PCA(t(log2(assays(sumExpObj_filt)$imputed_raw)),  graph = TRUE)
-```
-
-
-```{r}
-fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 50))
-```
-
-```{r}
-rowData(sumExpObj)$na_per <- (rowSums(is.na(assay(sumExpObj)))/dim(sumExpObj)[2])*100
-sumExpObj_filt <- sumExpObj[rowData(sumExpObj)$na_per <30 , ]
-assay(sumExpObj_filt, "log2plus1") <- log2(assay(sumExpObj))+1
-
-```
-
-```{r}
-limma::plotDensities(log2(assays(sumExpObj_filt)$imputed_raw), sumExpObj_filt$time)
-```
+We filter out values that have missing values in more that 25% of the sample if the median value is below 20.
 
 ```{r}
 
-limma::plotDensities(log2(assays(sumExpObj_filt)$raw_data), sumExpObj_filt$time)
+sumExpObj_overall <- sumExpObj_filt[rowData(sumExpObj_filt)$percent_missing < 25 & rowData(sumExpObj_filt)$prot_median > 18 , ]
+
+png("./results/figures/QC/missingPro_overall_filt.png", res = 300, width = 12000, height = 8000)
+mice_prot <- aggr(t(assays(sumExpObj_overall)$raw_data), col=c('navyblue','yellow'),
+ numbers=TRUE, sortVars=TRUE,
+ labels=sumExpObj_overall$screening_number, cex.axis=1,
+ gap=1, ylab=c("Missing data","Pattern"))
+dev.off()
+
+assays(sumExpObj_overall)$log2 <- log2(assays(sumExpObj_overall)$raw_data)
+assays(sumExpObj_overall)$loess <-limma::normalizeCyclicLoess(assays(sumExpObj_overall)$log2, iterations = 5) # Normalize using Loess on log2 trnasformed data
+assays(sumExpObj_overall)$vsn <- limma::normalizeVSN(log2(assays(sumExpObj_overall)$raw_data))
+
+sumExpObj_overall <- sumExpObj_overall[, !is.na(sumExpObj_overall$Type_1_2) | !is.na(sumExpObj_overall$tumor_type) ]
+sumExpObj_overall$tumor_type[grep("Other", sumExpObj_overall$tumor_type)] <- "Other"
+sumExpObj_overall$tumor_type <- as.factor(sumExpObj_overall$tumor_type) |> relevel(ref = "H")
+sumExpObj_overall$Type_1_2 <- as.factor(sumExpObj_overall$Type_1_2) |> relevel(ref = "0")
+
+
+saveRDS(sumExpObj_overall, "./data/sumExpObj_overall.rds")
 
 ```
 
+
+
+
 ```{r}
-
-assays(sumExpObj_filt)$vsn <- limma::normalizeVSN(assays(sumExpObj_filt)$raw_data)
-
-limma::plotDensities(assays(sumExpObj_filt)$vsn, sumExpObj_filt$time)
+sumExpObj_overall <- readRDS( "../data/sumExpObj_overall.rds")
+limma::plotDensities(assays(sumExpObj_overall)$loess , sumExpObj_filt$Sample_prep_batch)
+limma::plotDensities(assays(sumExpObj_overall)$vsn , sumExpObj_overall$Batch_Ash_2)
 ```
 
+> The density plost after normalizations using loess and vsn indicated a batch effect between summer and winter samples.
+> For the first round of analyses, the summer, summer_2 and winter samples were first analysesed independently and then compared with the 
+> staitics from the full data set.
+
+# Statistical ananlyses: Overall data set
+
+### Tumor type
+
 ```{r}
-vsn::meanSdPlot(assays(sumExpObj_filt)$vsn)
+rowData(sumExpObj_overall)$rowVars <- rowVars(assays(sumExpObj_overall)$loess, na.rm = TRUE)
+
+sumExpObj_overall_filt <- sumExpObj_overall[rowData(sumExpObj_overall)$rowVars > 0.5 & rowData(sumExpObj_overall)$rowVars < 3, ]
+   
+#design_t12 <- model.matrix(~ 0 + Type_1_2, data = colData(sumExpObj_overall_filt))
+
+design_tt <- model.matrix(~ 0 + tumor_type, data = colData(sumExpObj_overall_filt))
+
+name <- levels(sumExpObj_overall_filt$tumor_type)
+colnames(design_tt) <- name
+
+fit_tt <- lmFit((assays(sumExpObj_overall_filt)$loess), design = design_tt)
+contrast.matrix <- makeContrasts(B-H, BL-H, M-H, BL-B, M-B, levels=name)
+fit_tt <- contrasts.fit(fit_tt, contrast.matrix)
+fit_tt <- eBayes(fit = fit_tt)
+
+
+Results_overall <- list()
+
+Results_overall$Bnign_vs_Healthy <- topTable(fit_tt, p.value = 1, number = Inf, coef = "B - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall$BL_vs_H <- topTable(fit_tt, p.value = 1, number = Inf, coef = "BL - H" , confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  )  
+
+Results_overall$BL_vs_B <- topTable(fit_tt, p.value = 1, number = Inf, coef = "BL - B" , confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  )  
+
+Results_overall$Malignant_vs_Healthy <- topTable(fit_tt, p.value = 1, number = Inf, coef = "M - H" , confint = TRUE)  %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall$Malignant_vs_Benign <- topTable(fit_tt, p.value = 1, number = Inf, coef = "M - B" , confint = TRUE)  %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+```
+
+### Type_1_2 variable
+
+```{r}
+design_t12 <- model.matrix(~ 0 + Type_1_2, data = colData(sumExpObj_overall_filt))
+
+name <- levels(sumExpObj_overall_filt$Type_1_2)
+name <- c("zero", "one", "two")
+colnames(design_t12) <- name
+
+fit_12 <- lmFit((assays(sumExpObj_overall_filt)$loess), design = design_t12)
+contrast.matrix <- makeContrasts(one-zero, two-zero, two-one, levels=name)
+fit_12 <- contrasts.fit(fit_12, contrast.matrix)
+fit_12 <- eBayes(fit = fit_12)
+
+
+#Results_overall <- list()
+
+Results_overall$type_one_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "one - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall$type_two_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall$type_two_vs_one <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - one", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+Results_overall$data <- assays(sumExpObj_overall_filt)$no_batch_loess %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+writexl::write_xlsx(Results_overall, "./results/result_files/DE_results_overall_dataset.xlsx")
+
 ```
 
 
+# Batch effect removal and analysses 
+
+## Sample preparation batch
+
+### Type_1_2 variable
+
 ```{r}
 
-assays(sumExpObj_filt)$loess <- limma::normalizeCyclicLoess(log2(assays(sumExpObj_filt)$raw_data), iterations = 3) # Normalize using Loess on log2 trnasformed data
-limma::plotDensities(assays(sumExpObj_filt)$loess, sumExpObj_filt$time)
+assays(sumExpObj_overall_filt)$no_batch_loess <- removeBatchEffect(assays(sumExpObj_overall_filt)$loess,  batch = sumExpObj_overall_filt$Sample_prep_batch, design = design_t12)
+
+name <- levels(sumExpObj_overall_filt$Type_1_2)
+name <- c("zero", "one", "two")
+colnames(design_t12) <- name
+
+fit_12 <- lmFit((assays(sumExpObj_overall_filt)$no_batch_loess), design = design_t12)
+contrast.matrix <- makeContrasts(one-zero, two-zero, two-one, levels=name)
+fit_12 <- contrasts.fit(fit_12, contrast.matrix)
+fit_12 <- eBayes(fit = fit_12)
+
+
+Results_overall_b <- list()
+
+Results_overall_b$type_one_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "one - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$type_two_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$type_two_vs_one <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - one", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
 ```
 
-```{r}
-
-
-#assays(sumExpObj_filt)$batch_loess <- limma::removeBatchEffect(log2(assays(sumExpObj_filt)$loess), batch = sumExpObj_filt$Batch)
-limma::plotDensities(assays(sumExpObj_filt)$loess, sumExpObj_filt$time)
-saveRDS(sumExpObj_filt, "../data_sumExpfilImp.rds")
-```
+### Tumor type Variable
 
 ```{r}
-res.pca_loess <- PCA(t(assays(sumExpObj_filt)$loess),  graph = TRUE)
-```
+design_tt_b <- model.matrix(~ 0 + tumor_type, data = colData(sumExpObj_overall_filt))
 
-```{r}
-exp_var <- fviz_screeplot(res.pca_loess, addlabels = TRUE, ylim = c(0, 12))
-ggsave(exp_var,
-  file = paste("../",
-    "explained_var", ".png",
-    sep = ""
-  ),
-  scale = 2,
-  units = "cm", height = 10, width = 15
-)
-```
+name_b <-  levels(sumExpObj_overall_filt$tumor_type)
 
-```{r}
-# scores plot (interactive)
-ind <- get_pca_ind(res.pca_loess)
-ind
-fviz_pca_ind(res.pca, col.ind = "cos2", 
-             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
-             repel = TRUE # Avoid text overlapping (slow if many points)
-             )
-pca.frame <- data.frame(PC1 = round(res.pca$ind$coord[,1], 2), 
-                        PC2 = round(res.pca$ind$coord[,2], 2), 
-                        PC3 = round(res.pca$ind$coord[,3], 2), 
-                        PC4 = round(res.pca$ind$coord[,4], 2),
-                        PC5 = round(res.pca$ind$coord[,5], 2),
-                        group = factor(data.naomit$Group, labels = c("Low", "High")),
-                        SCANB = data.naomit$SCANB)
+colnames(design_tt_b) <- name_b
+
+# assays(sumExpObj_overall_filt)$test2 <-removeBatchEffect(assays(sumExpObj_overall_filt)$loess,  batch = sumExpObj_overall_filt$Sample_prep_batch, design = design_tt_b)
+
+fit_tt_b <- lmFit((assays(sumExpObj_overall_filt)$no_batch_loess), design = design_tt_b)
+contrast.matrix_b <- makeContrasts(B-H, BL-H, M-H , BL-B, M-B, M-BL, levels=name_b)
+fit_tt_b <- contrasts.fit(fit_tt_b, contrast.matrix_b)
 
   
-pca.var <- res.pca$eig[,3] %>%
-  round(2)
-  
+
+
+fit_tt_b <- eBayes(fit = fit_tt_b)
+
+
+
+
+Results_overall_b$Bnign_vs_H <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "B - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_H <-  topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_B <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - B", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_BL <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - BL", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$data <- assays(sumExpObj_overall_filt)$no_batch_loess %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+
+writexl::write_xlsx(Results_overall_b, "./results/result_files/DE_results_overall_dataset_SamplePrep_batch_removed.xlsx")
+
 
 ```
+
+
+## Season batch
+
+### Type_1_2 variable
+
+```{r}
+
+assays(sumExpObj_overall_filt)$no_batch_loess_season <- removeBatchEffect(assays(sumExpObj_overall_filt)$loess,  batch = sumExpObj_overall_filt$Batch_Ash_2, design = design_t12)
+
+name <- levels(sumExpObj_overall_filt$Type_1_2)
+name <- c("zero", "one", "two")
+colnames(design_t12) <- name
+
+fit_12 <- lmFit((assays(sumExpObj_overall_filt)$no_batch_loess_season), design = design_t12)
+contrast.matrix <- makeContrasts(one-zero, two-zero, two-one, levels=name)
+fit_12 <- contrasts.fit(fit_12, contrast.matrix)
+fit_12 <- eBayes(fit = fit_12)
+
+
+Results_overall_b_s <- list()
+
+Results_overall_b_s$type_one_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "one - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$type_two_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$type_two_vs_one <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - one", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+```
+
+### Tumor type Variable
+
+```{r}
+design_tt_b <- model.matrix(~ 0 + tumor_type, data = colData(sumExpObj_overall_filt))
+
+name_b <-  levels(sumExpObj_overall_filt$tumor_type)
+
+colnames(design_tt_b) <- name_b
+
+# assays(sumExpObj_overall_filt)$test2 <-removeBatchEffect(assays(sumExpObj_overall_filt)$loess,  batch = sumExpObj_overall_filt$Sample_prep_batch, design = design_tt_b)
+
+fit_tt_b <- lmFit((assays(sumExpObj_overall_filt)$no_batch_loess_season), design = design_tt_b)
+contrast.matrix_b <- makeContrasts(B-H, BL-H, M-H , BL-B, M-B, M-BL, levels=name_b)
+fit_tt_b <- contrasts.fit(fit_tt_b, contrast.matrix_b)
+
+  
+
+
+fit_tt_b <- eBayes(fit = fit_tt_b)
+
+
+
+
+Results_overall_b_s$Bnign_vs_H <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "B - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$Malignant_vs_H <-  topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$Malignant_vs_B <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - B", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$Malignant_vs_BL <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - BL", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b_s$data <- assays(sumExpObj_overall_filt)$no_batch_loess_season %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) %>% 
+            as_tibble(), 
+  {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+ writexl::write_xlsx(Results_overall_b_s, 
+  "./results/result_files/DE_results_overall_dataset_Season_batch_removed.xlsx")
+
+
+```
+
+
+
+# Batchwise analyses and meta analyses 
+
+## Analyses in Summer, autumn and winter batches
+
+## Analyses in Sample preparation batches
+
+
+```{r}
+sumExpObj_overall$Type_1_2_new <- case_when(
+  sumExpObj_overall$Type_1_2 ==0 ~ "zero",
+  sumExpObj_overall$Type_1_2 ==1 ~ "one",
+    sumExpObj_overall$Type_1_2 ==2 ~ "two"                                    
+                                        )
+sumExpObj_overall$Type_1_2_new <- as.factor(sumExpObj_overall$Type_1_2_new)
+sumExpObj_overall$Type_1_2_new <- relevel(sumExpObj_overall$Type_1_2_new, ref="zero")
+batches <- unique(sumExpObj_overall$Batch_Ash_2)
+season_batches <- list()
+
+for  (i in 1:length(batches)){
+  
+  season_batches[[batches[i]]] <- sumExpObj_overall[, sumExpObj_overall$Batch_Ash_2 == batches[i]] # subset each batch
+  
+  png(paste0("./results/figures/QC/", batches[i], "_missingProt.png"), res = 300, width = 12000, height = 8000)
+  mice_prot <- aggr(t(assays(season_batches[[batches[i]]])$raw_data), col=c('navyblue','yellow'),
+  numbers=TRUE, sortVars=TRUE,
+  labels=season_batches[[batches[i]]]$screening_number, cex.axis=1,
+  gap=1, ylab=c("Missing data","Pattern"))
+  dev.off()
+
+  ## Create data for missing values
+  rowData(season_batches[[batches[i]]])$nmissing <- mice_prot$missings$Count
+  
+  rowData(season_batches[[batches[i]]])$percent_missing <- (mice_prot$missings$Count/dim(season_batches[[batches[i]]])[2])*100
+
+  
+  season_batches[[batches[i]]] <-  season_batches[[batches[i]]][rowData(season_batches[[batches[i]]])$percent_missing < 25,]
+  
+  
+  rowData(season_batches[[batches[i]]])$prot_means <- assays(season_batches[[batches[i]]])$raw_data |> log2() |> rowMeans(na.rm = TRUE)
+  
+  rowData(season_batches[[batches[i]]])$prot_median <- assays(season_batches[[batches[i]]])$raw_data |> log2() |> rowMedians(na.rm = TRUE)
+  
+  
+  assays(season_batches[[batches[i]]])$log2 <- log2(assays(season_batches[[batches[i]]])[["raw_data"]])
+  assays(season_batches[[batches[i]]])$loess_batch <- limma::normalizeCyclicLoess(assays(season_batches[[batches[i]]])[["log2"]], iterations = 5)
+ 
+  # assays(season_batches[[batches[i]]])$vsn_batch <- limma::normalizeVSN(assays(season_batches[[batches[i]]])[["log2"]])
+  
+  png(paste0("./results/figures/QC/Desities_raw_",batches[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  limma::plotDensities(assays(season_batches[[batches[i]]])[["log2"]], season_batches[[batches[i]]]$Batch)
+  dev.off()
+ 
+  png(paste0("./results/figures/QC/Desities_loess_batch_",batches[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  limma::plotDensities(assays(season_batches[[batches[i]]])[["loess_batch"]], season_batches[[batches[i]]]$Batch)
+  dev.off() 
+  
+  #  png(paste0("./results/figures/QC/Desities_vsn_batch_",batches[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  # limma::plotDensities(assays(season_batches[[batches[i]]])[["vsn_batch"]], season_batches[[batches[i]]]$Batch)
+  # dev.off() 
+  
+  
+   rowData(season_batches[[batches[i]]])$row_vars <- assays(season_batches[[batches[i]]])$loess_batch |> rowVars(na.rm = TRUE)
+
+   season_batches[[batches[i]]] <-  season_batches[[batches[i]]][rowData(season_batches[[batches[i]]])$row_vars > 0.5 & rowData(season_batches[[batches[i]]])$row_vars < 3,]
+  
+}
+
+common_prot <- Reduce(intersect, lapply(season_batches, rownames))
+season_batches_f <- lapply(season_batches , function(x) x[common_prot,] )
+```
+
+
+## Differeential abundancee analyses 
+
+```{r}
+for  (i in 1:length(batches)){
+  
+  data <- season_batches[[batches[i]]]
+  design_tt_b <- model.matrix(~ 0 + tumor_type, data = colData(data))
+
+design_t12 <- model.matrix(~ 0 + Type_1_2, data = colData(data))
+
+name <- levels(data$Type_1_2)
+name <- c("zero", "one", "two")
+colnames(design_t12) <- name
+
+fit_12 <- lmFit((assays(data)$loess), design = design_t12)
+contrast.matrix <- makeContrasts(one-zero, two-zero, two-one, levels=name)
+fit_12 <- contrasts.fit(fit_12, contrast.matrix)
+fit_12 <- eBayes(fit = fit_12)
+
+
+Results_overall_b <- list()
+
+Results_overall_b$type_one_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "one - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$type_two_vs_zero <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - zero", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$type_two_vs_one <- topTable(fit_12, p.value = 1, number = Inf, coef = "two - one", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+Results_overall_b$data <- assays(data)$batch_loess %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+
+#######
+
+
+
+### Tumor type 
+design_tt_b <- model.matrix(~ 0 + tumor_type, data = colData(data))
+
+name_b <-  levels(data$tumor_type)
+
+colnames(design_tt_b) <- name_b
+
+# assays(sumExpObj_overall_filt)$test2 <-removeBatchEffect(assays(sumExpObj_overall_filt)$loess,  batch = sumExpObj_overall_filt$Sample_prep_batch, design = design_tt_b)
+
+fit_tt_b <- lmFit((assays(data)$loess_batch), design = design_tt_b)
+contrast.matrix_b <- makeContrasts(B-H, BL-H, M-H , BL-B, M-B, M-BL, levels=name_b)
+fit_tt_b <- contrasts.fit(fit_tt_b, contrast.matrix_b)
+
+  
+
+
+fit_tt_b <- eBayes(fit = fit_tt_b)
+
+
+
+
+Results_overall_b$Bnign_vs_H <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "B - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_H <-  topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - H", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_B <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - B", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$Malignant_vs_BL <- topTable(fit_tt_b, p.value = 1, number = Inf, coef = "M - BL", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+Results_overall_b$data <- assays(data)$loess_batch %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(data) |> as_tibble(),
+    {
+      .
+    },
+    by ="Protein.Group"
+  ) 
+
+
+
+writexl::write_xlsx(Results_overall_b, paste0("./results/result_files/DE_results_" , batches[i], ".xlsx"))
+
+  
+}
+  
+```
+
+
+## Perform meta analysees
+
+
+```{r}
+loess_batches <- lapply(season_batches_f, function(x) (assays(x))$loess_batch)
+loess_lables <- lapply(season_batches_f, colnames)
+outcome_ttype <- lapply(season_batches_f, function(x) (colData(x)$Type_1_2_new))
+
+outcome_ttype_df <- lapply(outcome_ttype, function(x) {data.frame(x)} )
+for (k in 1:length(outcome_ttype_df)){
+   colnames(outcome_ttype_df[[k]]) <- "label"
+}
+
+select.group <- c('zero','one')
+ref.level <- "zero"
+data.type <- "continuous"
+ind.method <- rep('limma',length(outcome_ttype))
+resp.type <- "twoclass"
+paired <- rep(FALSE,length(outcome_ttype))
+meta.method <- "Fisher"
+#REM.type <- "RML"
+meta.res <- MetaDE(data=loess_batches,clin.data = outcome_ttype_df,
+                    data.type=data.type,resp.type = resp.type,
+                    response='label',
+                    ind.method=ind.method, meta.method=meta.method,
+                    select.group = select.group, ref.level=ref.level,
+                    paired=paired,tail='abs',parametric=TRUE)
+
+meta_results <- list()
+meta_results$Type_1_vs_0 <- MetaDE::summary.meta(meta.res, resp.type = resp.type, meta.method = meta.method) %>% as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) %>% 
+            as_tibble(), 
+  {
+      .
+    },
+    by ="Protein.Group"
+  ) %>% arrange(FDR)
+
+
+select.group <- c("one","two")
+ref.level <- "one"
+data.type <- "continuous"
+ind.method <- rep('limma',length(outcome_ttype))
+resp.type <- "twoclass"
+paired <- rep(FALSE,length(outcome_ttype))
+meta.method <- "Fisher"
+#REM.type <- "RML"
+meta.res2 <- MetaDE(data=loess_batches,clin.data = outcome_ttype_df,
+                    data.type=data.type,resp.type = resp.type,
+                    response='label',
+                    ind.method=ind.method, meta.method=meta.method,
+                    select.group = select.group, ref.level=ref.level,
+                    paired=paired,tail='abs',parametric=TRUE )
+
+meta_results$Type_2_vs_1 <- MetaDE::summary.meta(meta.res2, resp.type = resp.type, meta.method = meta.method) %>% as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) %>% 
+            as_tibble(), 
+  {
+      .
+    },
+    by ="Protein.Group"
+  ) %>% arrange(FDR)
+
+View(meta.res.summary_02)
+
+select.group <- c("zero","two")
+ref.level <- "zero"
+data.type <- "continuous"
+ind.method <- rep('limma',length(outcome_ttype))
+resp.type <- "twoclass"
+paired <- rep(FALSE,length(outcome_ttype))
+meta.method <- "Fisher"
+#REM.type <- "RML"
+meta.res3 <- MetaDE(data=loess_batches,clin.data = outcome_ttype_df,
+                    data.type=data.type,resp.type = resp.type,
+                    response='label',
+                    ind.method=ind.method, meta.method=meta.method,
+                    select.group = select.group, ref.level=ref.level,
+                    paired=paired,tail='abs',parametric=TRUE )
+
+meta_results$Type_2_vs_0 <- MetaDE::summary.meta(meta.res3, resp.type = resp.type, meta.method = "Fisher")  %>% as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+left_join(rowData(sumExpObj_overall_filt) %>% 
+            as_tibble(), 
+  {
+      .
+    },
+    by ="Protein.Group"
+  ) %>% arrange(FDR)
+
+writexl::write_xlsx(meta_results, 
+  "./results/result_files/Meta_analyses_results.xlsx")
+
+```
+
+```{r}
+heatmap.sig.genes(result = meta.res, meta.method = "Fisher",fdr.cut = 0.2,color="GR")
+```
+
+
+```{r}
+outcome_t_1_2 <- lapply(season_batches, function(x) (colData(x)$Type_1_2))
+
+Results_Type_1_2_batch <- list()
+Results_tumor_type_batch <- list()
+
+```
+
+
+
+```{r}
+design_type <- Type_1_2
+  
+#tumor_type <- as.factor(season_batches[[batches[i]]]$tumor_type) |> relevel(ref = "H")
+#design_test <- model.matrix(~ 0 + Type_1_2, data = colData(sumExpObj_filt))
+
+design_tt <- model.matrix(~ 0 + data_all_tt$tumor_type, data = colData(season_batches[[batches[i]]]))
+name <- levels(season_batches[[batches[i]]]$tumor_type)
+colnames(design_tt) <- name
+
+fit_tt <- lmFit((assays(data_all_tt)$loess), design = design_tt)
+contrast.matrix <- makeContrasts(B-H, BL-H, M-H, BL-B, M-B, levels=name)
+fit2 <- contrasts.fit(fit_tt, contrast.matrix)
+fit_tt <- eBayes(fit = fit_tt)
+Results$Bnign <- topTable(fit_tt, p.value = 1, number = Inf, coef = "B")
+Results$Bnign_local <- topTable(fit_tt, p.value = 1, number = Inf, coef = "BL")
+Results$Malignant <- topTable(fit_tt, p.value = 1, number = Inf, coef = "Malignant")
+
+  
+}
+```
+
+
+```{r}
+renv::restore("../renv 2.lock")
+```
+
 
 ### PCA analyses
 
 Principle component analyses was used to perform exploratory analyses of the proteomics data. Explained variance by each principle component was calculated using the output from prcomp´ function in R. Correlation between principle components and phenotype (clinical) variables was calculated using ´lm´ function in R and "adj.r.squared" values were extracted from the summary statistics produced by the ´lm´ function.
 
 ```{r, eval = FALSE,include=FALSE,  echo = FALSE, fig.width=10, fig.height=18, warning = FALSE, message= FALSE}
-is.na(assays(Data_se_comp)$imputed) %>% sum()
 
-pcaobjl <- stats::prcomp(t(na.omit(assays(sumExpObj_filt)$loess)), )
+pcaobjl <- stats::prcomp(t(log2(na.omit(assays(sumExpObj_filt)$loess))), )
 
 percentVarl <- round(pcaobjl$sdev^2 / sum(pcaobjl$sdev^2),2)*100
 
-pcamatl1 <- as.data.frame(pcaobjl$x)
-pcamatl2 <- as.data.frame(merge(pcamatl1, colData(sumExpObj_filt), by = 0))
-pcamatl2
+pcamatl1 <- as.data.frame(pcaobjl$x[,1:20])
+colData(sumExpObj_filt) <- merge(as.data.frame(colData(sumExpObj_filt)), pcamatl1 , by = 0) %>% set_rownames(.$Sample_ID) |> DataFrame()
+saveRDS(sumExpObj_filt, "./data/data_sumExpfil.rds")
+
 ```
 
 ### Plot sample overview using PCA
 
 ```{r eval=FALSE, include=FALSE}
-plot.pca1 <- ggplot(pcamatl2, aes(PC1, PC2, color = Batch, text = Row.names)) + 
+plot.pca1 <- ggplot(as.data.frame(colData(sumExpObj_filt)), aes(PC1, PC3, color = Sample_prep_batch)) + 
   geom_point(size=2, alpha = 0.9) + 
-  scale_colour_brewer(palette = "Set2") + 
+  #scale_colour_brewer(palette = "Set2") + 
   xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
   ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
   theme_bw() + 
-   geom_text(
-    label=pcamatl2$time, 
-    nudge_x = 0.25, nudge_y = 0.25, 
-    check_overlap = T
-  ) + 
+    geom_text(
+     label=sumExpObj_filt$Sample_prep_batch, 
+  #   #nudge_x = 0.25, nudge_y = 0.25, 
+  #   check_overlap = T
+   ) + 
   ggtitle("PCA color indicating the batch and lable indicating the time-point") +
   theme(legend.title = element_blank())
+plot.pca1
 
-#ggplotly(plot.pca12)
+ggplotly(plot.pca1)
 
 ggsave(plot.pca1,
-  file = paste("../",
-    "PCA_batch_time", ".png",
-    sep = ""
-  ),
-  scale = 2,
-  units = "cm", height = 10, width = 15
-)
-randomisation_code
-
-plot.pca12 <- ggplot(pcamatl2, aes(PC1, PC2, color = Batch, text = Row.names)) + 
-  geom_point(size=2, alpha = 0.9) + 
-  scale_colour_brewer(palette = "Set2") + 
-  xlab(paste("PC1: ", percentVarl[1], "% variance", sep="")) + 
-  ylab(paste("PC2: ", percentVarl[2], "% variance", sep="")) + 
-  theme_bw() + 
-  geom_text(
-    label=pcamatl2$randomisation_code, 
-    nudge_x = 0.25, nudge_y = 0.25, 
-    check_overlap = T
-  ) +
-  ggtitle("PCA color indicating the batch and lable indicating the temperature group") +
-  theme(legend.title = element_blank())
-plot.pca12  
-ggsave(plot.pca12,
-  file = paste("../",
-    "PCA_batch_rand_code", ".png",
+  file = paste("./results/figures/QC/",
+    "PCA_batch_season", ".png",
     sep = ""
   ),
   scale = 2,
@@ -350,40 +1087,77 @@ ggsave(plot.pca12,
 ```
 
 
+---------------------
 
 
-```{r eval=FALSE, include=FALSE}
-pca <- stats::prcomp(t(na.omit(assays(sumExpObj_filt)$loess)), )
-
-g <- ggbiplot(pca,
-  obs.scale = 1, var.scale = 1,
-  groups = sumExpObj_filt$time, ellipse = T,
-  circle = TRUE, var.axes = F, labels = sumExpObj_filt$Batch
-) +
-  scale_color_discrete(name = "") +
-  theme(
-    legend.direction = "horizontal",
-    legend.position = "top"
-  ) +
-  theme_bw()
-
-ggsave(g,
-  file = paste("../Results/Figures/",
-    "PCA_lables", ".png",
-    sep = ""
-  ),
-  scale = 2,
-  units = "cm", height = 15, width = 10
-)
 
 
+
+Remove the pool samples and duplicated patient IDs.
+
+```{r}
+seasons <- unique(sumExpObj_filt$Batch_Ash_2)
+
+
+season_batches <- list()
+
+for  (i in 1:length(seasons)){
+  season_batches[[seasons[i]]] <- sumExpObj_filt_2[, sumExpObj_filt_2$Batch_Ash_2 == seasons[i]]
+  assays(season_batches[[seasons[i]]])$loess_batch <- limma::normalizeCyclicLoess(log2(assays(season_batches[[seasons[i]]])[["raw_data"]]), iterations = 5)
+  assays(season_batches[[seasons[i]]])$vsn_batch <- limma::normalizeVSN(log2(assays(season_batches[[seasons[i]]])[["raw_data"]]))
+  
+  png(paste0("./results/figures/QC/Desities_raw_f",seasons[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  limma::plotDensities(log2(assays(season_batches[[seasons[i]]])[["raw_data"]]), season_batches[[seasons[i]]]$Batch)
+  dev.off()
+ 
+  png(paste0("./results/figures/QC/Desities_loess_batch_f",seasons[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  limma::plotDensities(assays(season_batches[[seasons[i]]])[["loess_batch"]], season_batches[[seasons[i]]]$Batch)
+  dev.off() 
+  
+   png(paste0("./results/figures/QC/Desities_vsn_batch_f",seasons[i], ".png"), res = 300, units = "cm", height = 10, width = 15)
+  limma::plotDensities(assays(season_batches[[seasons[i]]])[["vsn_batch"]], season_batches[[seasons[i]]]$Batch)
+  dev.off() 
+  
+}
 ```
+
+
+
+
+
 
 ## Cluster samples
+```{r}
+
+```
+
+********Fix this
 
 ```{r  eval=FALSE, include=FALSE, echo = FALSE, fig.width=20, fig.height=18, warning = FALSE, message= FALSE}
 distsl <- dist(t(assays(sumExpObj_filt)$loess))
-plot(hclust(distsl))
+
+hc <-hclust(distsl)
+labs <- colnames(sumExpObj_filt)
+dendr    <- ggdendro::dendro_data(hc, type="rectangle") # convert for ggplot
+clust    <- cutree(hc,k=4)    # find 4 clusters
+
+clust.df <- data.frame(label=names(clust), cluster=factor(clust))
+# dendr[["labels"]] has the labels, merge with clust.df based on label column
+dendr[["labels"]] <- merge(dendr[["labels"]],clust.df, by="label")
+# plot the dendrogram; note use of color=cluster in geom_text(...)
+ggplot() + 
+  geom_segment(data=segment(dendr), aes(x=x, y=y, xend=xend, yend=yend)) + 
+  geom_text(data=label(dendr), aes(x, y, label=label, hjust=0, color=cluster), 
+           size=3) +
+  coord_flip() + scale_y_reverse(expand=c(0.2, 0)) + 
+  theme(axis.line.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.title.y=element_blank(),
+        panel.background=element_rect(fill="white"),
+        panel.grid=element_blank())
+
+ggdendro::ggdendrogram(hc)
 ```
 
 ## Explained variance by PCs
@@ -391,7 +1165,7 @@ plot(hclust(distsl))
 This step calculates explained variance by each principle component of the protein data.
 
 ```{r eval=FALSE, include=FALSE}
-png("../Results/Figures/PC_VariancePlot.png", units = "cm", height = 24, width = 20, res = 300)
+png("./results/figures/QC/PC_VariancePlot.png", units = "cm", height = 24, width = 20, res = 300)
 barplot(percentVarl[1:10] , ylab = "Percent varinace explained", xlab = "PC 1 to 10", main = "Percent variace explained by first 10 PCs (loess)", col = "purple")
 dev.off()
 ```
@@ -402,18 +1176,26 @@ To identify the most relevant clinical variables associated with protein data, w
 
 ```{r eval=FALSE, include=FALSE}
 
-pheno <- pcamatl2[ ,clin_vars]
+#clin_vars <- c("Batch", "Age_dignosis", "CA125_preop", "tumor_type", "Type", "Histology_PAD" , "FIGO_2014" ,  "Type_1_2" , "FIGO_stage", "Endometrios_at_op", "Endometrios_prior_op" , "Neo_recidiv_staging_op")
+
+clin_vars <- c("Batch", "Batch_Ash_2", "Age_dignosis",  "tumor_type", "Type",  "Type_1_2" , "Endometrios_at_op", "Endometrios_prior_op")
+
+tech_var <- c("Batch" , "Clinic ID", "Run_date"   , "Sampling_date" , "Op.date" , "nmissing" , )
+
+
+pheno <- colData(sumExpObj_filt)[ ,clin_vars]
+pcs <- colData(sumExpObj_filt)[, grep("PC", colnames(colData(sumExpObj_filt)))[1:10]]
 
 pc_adj_rsq_l <- matrix(NA, ncol = 10, nrow = dim(pheno)[2])
 
 for (i in 1:dim(pheno)[2]) {
-  pc_adj_rsq_l[i, ] <- apply(pcamatl2[, 2:11], 2, function(x) summary(lm(x ~ pheno[, i]))$adj.r.squared)
+  pc_adj_rsq_l[i, ] <- apply(pcs, 2, function(x) summary(lm(x ~ pheno[, i]))$adj.r.squared)
 }
-colnames(pc_adj_rsq_l) <- colnames(pcamatl2[, 2:11])
+colnames(pc_adj_rsq_l) <- colnames(pcs)
 rownames(pc_adj_rsq_l) <- colnames(pheno)
 
 
-png("../corrPlot_updated.png", units = "cm", height = 24, width = 20, res = 300)
+png("./results/figures/QC/PC_phen_updated.png", units = "cm", height = 24, width = 20, res = 300)
 pheatmap::pheatmap(pc_adj_rsq_l, display_numbers = TRUE, fontsize = 12, cluster_cols = FALSE, main = "Adj R^2 of Association between PCs and clinical  and technical variables")
 dev.off()
 ```
@@ -532,7 +1314,7 @@ dev.off()
 
 ```{r}
 colData(sumExpObj_filt) <- merge(colData(sumExpObj_filt), pcamatl1[, 1:15], by = 0)
-#saveRDS(sumExpObj_filt, "../normalized_filtered_se.rds")
+saveRDS(sumExpObj_filt, "../normalized_filtered_se.rds")
 ```
 
 
@@ -742,4 +1524,21 @@ QQ-plots to see how imputed values affect normal distribution:
 
 
 ``` 
+
+
+
+## PCA
+
+```{r}
+library()
+library("FactoMineR")
+
+res.pca <- PCA(t(log2(assays(sumExpObj_filt)$raw_data)),  graph = TRUE)
+```
+
+
+```{r}
+fviz_screeplot(res.pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
 
