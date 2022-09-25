@@ -1,0 +1,754 @@
+---
+title: "Ovarian Cancer proteomics - prediction¨"
+format: html
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+## Libraries 
+```{r}
+#renv::install(c("hadley/emo", "heike/extracat"))
+pkgs <- c(
+  "AmesHousing",
+  "AppliedPredictiveModeling",
+  "bookdown",
+  "broom",
+  "caret",
+  "caretEnsemble",
+  "cluster",
+  "cowplot",
+  "DALEX",
+  "data.table",
+  "doParallel",
+  "dplyr",
+  "janitor",
+  "dslabs",
+  "e1071",
+  "earth",
+ # "emo",
+ # "extracat",
+  "factoextra",
+  "foreach",
+  "forecast",
+  "ggbeeswarm",
+  "ggmap",
+  "ggplot2",
+  "ggplotify",
+  "gbm",
+  "glmnet",
+  "gridExtra",
+  "h2o",
+  "HDclassif",
+  "iml",
+  "ipred",
+  "kableExtra",
+  "keras",
+  "kernlab",
+  "knitr",
+  "lime",
+  "markdown",
+  "MASS",
+  "Matrix",
+  "mclust",
+  "mlbench",
+  "NbClust",
+  "pBrackets",
+  "pcadapt",
+  "pdp",
+  "plotROC",
+  "pls",
+  "pROC",
+  "purrr",
+  "ranger",
+  "readr",
+  "recipes",
+  "reshape2",
+  "ROCR",
+  "rpart",
+  "rpart.plot",
+  "rsample",
+  "scales",
+  "sparsepca",
+  "stringr",
+  "subsemble",
+  "SuperLearner",
+  "tfruns",
+  "tfestimators",
+  "tidyr",
+  "vip",
+  "visdat",
+  "xgboost",
+  "yardstick"
+)
+
+renv::install(pkgs)
+```
+
+```{r}
+library(tidyverse)
+library(h2o)
+```
+
+
+
+```{r}
+sumExpObj_overall <- readRDS( "../data/rawdata/data_sumExpfil_wntr_new_vars.rds")
+```
+
+ - Data prparation: pre-processing the feature and target variables, 
+ - minimizing data leakage (Section 3.8.2), ??
+ - Tuning hyperparameters
+ - Assessing model performance. 
+
+## Data preparation
+
+The normalized data is used for machine learning approach. Initially, 1)
+the Malignant vs. benign from the "type" variable and 2) categories 2 vs
+zero from the "type_1\_2" variable are the focus. 3) Re-categorise BL
+samples to B (Benign category)
+
+This is due to sample sizes in these subgroups.
+
+## Remove correlated fatures
+
+```{r}
+#sumExpObj_overall <- sumExpObj_overall[, sumExpObj_overall$tumor_type %nin% c("Other", "BL")]
+```
+
+## Filter unwanted samples from the data and fix lables
+
+```{r}
+
+library(Hmisc)
+library(ggplot2)
+sumExpObj_overall_ml_type <- sumExpObj_overall[, sumExpObj_overall$tumor_type %nin% c( "Other" , "H")]
+sumExpObj_overall_ml_type$tumor_type <- droplevels(sumExpObj_overall_ml_type$tumor_type)
+sumExpObj_overall_ml_type$tumor_type_2 <- ifelse(sumExpObj_overall_ml_type$tumor_type == "B" | sumExpObj_overall_ml_type$tumor_type == "BL",  "benign","malignant" )
+
+sumExpObj_overall_ml_type12 <- sumExpObj_overall[, sumExpObj_overall$Type_1_2 != c("1") ]
+sumExpObj_overall_ml_type12$Type_1_2  <- sumExpObj_overall_ml_type12$Type_1_2 |> droplevels() |> as.numeric()
+sumExpObj_overall_ml_type12$Type_1_2  <- (sumExpObj_overall_ml_type12$Type_1_2  - 1) 
+
+rowData(sumExpObj_overall_ml_type12)$protein <- str_split(rownames(sumExpObj_overall_ml_type12), pattern = ";", simplify = TRUE)[,1] |> make.unique()
+```
+
+
+
+## Then we remove the highly correlated features from the data
+
+```{r}
+library(caret)
+nzv <- nearZeroVar(t(assays(sumExpObj_overall)$norm_imputed), saveMetrics= TRUE)
+descrCor <-  cor(t(assays(sumExpObj_overall)$norm_imputed), use = "na.or.complete" )
+highCorr <- sum(abs(descrCor[upper.tri(descrCor)]) > .95)
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .90)
+low_var <- which(rowData(sumExpObj_overall)$rowVars <)
+#sumExpObj_overall_ml_type <- sumExpObj_overall_ml_type[-highlyCorDescr,]
+sumExpObj_overall_ml_type12 <- sumExpObj_overall[-highlyCorDescr,]
+sumExpObj_overall_ml_type12 <- sumExpObj_overall[-highlyCorDescr,]
+data_type_12 <- data.frame(sumExpObj_overall_ml_type12$tumor_type_new,  t(assays(sumExpObj_overall_ml_type12)$norm_imputed) )
+colnames(data_type_12)[1] <- "label"
+data_type_12$label <- as.factor(data_type_12$label)
+```
+
+## Train test split and scaling of data
+
+```{r}
+set.seed(123)
+
+
+trainIndex <- createDataPartition(data_type_12$label, p = .9, 
+                                  list = FALSE, 
+                                  times = 1)
+test <- preProcess(data_type_12[-1])
+
+train_prot <- data_type_12[trainIndex,]
+train_prot_scaled <- predict(test, train_prot[, -1])
+#train_prot_scaled <- data.frame(train_prot$label)
+train_prot_all <- cbind(label=train_prot$label, train_prot_scaled) |> as.data.frame()
+test_prot <- data_type_12[-trainIndex,]
+test_prot_scaled <- predict(test, test_prot[,-1])
+test_prot_all <- cbind(label = test_prot$label, test_prot_scaled) |> as.data.frame()
+```
+
+
+## Build models
+
+### With h2O and DALEX
+
+```{r}
+#h2o.removeAll() # Clean up. Just in case H2O was already running
+h2o.init(nthreads = -1, max_mem_size="10G")  # Start an H2O cluster with all threads available
+# convert to h2o object
+df.h2o <- as.h2o(data_type_12)
+
+# create train, validation, and test splits
+#set.seed(123)
+splits <- h2o.splitFrame(df.h2o, ratios = 0.8, destination_frames = c("train","test"), seed = 1234)
+names(splits) <- c("train","test")
+
+# variable names for resonse & features
+response <- "label"
+features <- setdiff(names(data_type_12), response) 
+```
+
+
+```{r}
+n_features <- length(features)
+hyper_grid_1 <- list(ntrees = seq(50, 200, by = 20),
+                     mtries = floor(n_features * c(0.025, 0.040 , .05,0.075, 0.1, 0.15, 0.2)),
+                    min_rows = c(1, 3, 5, 10),
+                  max_depth = c(1, 5,10, 20, 25,30, 35),
+                  sample_rate = seq(0.7, 0.85, by = 0.05),
+                  nbins = seq(20, 80, 10)
+                  
+)
+
+ search_criteria = list(strategy = "RandomDiscrete", 
+                        max_models = 100, 
+                        max_runtime_secs = 1000 * 60
+                        )
+ 
+grid_crtsn <- h2o.grid( algorithm = "randomForest",
+                        x = features,
+                        y= response,
+                        grid_id = "rf_grid2",
+                        nfolds= 3,
+                        stopping_metric = "AUC", 
+                        training_frame = splits$train,
+                        stopping_rounds = 5,         
+                        stopping_tolerance = 0.005,
+                        seed = 1234,
+                        hyper_params = hyper_grid_1,
+                       search_criteria = search_criteria
+    
+)
+```
+
+
+```{r}
+best_model <-  h2o.get_best_model()
+```
+
+
+```{r}
+grid_perf <- h2o.getGrid(grid_id = "rf_grid2",
+                         sort_by = "AUC",
+                         decreasing = T)
+grid_perf@summary_table
+best_model <-  h2o.get_best_model(grid_perf)
+h2o.varimp(best_model)
+pred <- h2o.predict(object = best_model, newdata = splits$test)
+```
+
+
+```{r}
+# random forest model
+rf <- h2o.randomForest(y="label",
+  training_frame = splits$train,
+  validation_frame = splits$valid,
+  ntrees = 1000,
+  stopping_metric = "AUC",    
+  stopping_rounds = 10,         
+  stopping_tolerance = 0.005,
+  seed = 123
+  )
+
+```
+
+## Logistic regression
+
+## Random forrest 
+1. The number of trees in the forest
+2. The number of features to consider at any given split:  
+3. The complexity of each tree
+4. The sampling scheme
+5. The splitting rule to use during tree construction
+
+and (2) typically have the largest impact on predictive accuracy and should always be tuned. (3) and (4) tend to have marginal impact on predictive accuracy but are still worth exploring. They also have the ability to influence computational efficiency. (5) tends to have the smallest impact on predictive accuracy and is used primarily to increase computational efficiency.
+
+```{r}
+# train a default random forest model
+prot_rf1 <- ranger(
+  label ~ ., 
+  data = train_prot_all,
+  mtry = floor(n_features / 3),
+  respect.unordered.factors = "ignore",
+  seed = 123
+)
+
+# get OOB RMSE
+(default_rmse <- sqrt(prot_rf1$prediction.error))
+```
+
+```{r}
+library(ranger)
+n_features <- length(setdiff(names(train_prot_all), "label"))
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+  mtry = floor(n_features * c(0.25, .05,0.075, 0.1, .15, 0.2 ,.25, .333, .4)),
+  min.node.size = c(1,2, 3, 4, 5, 10), 
+  replace = FALSE,                               
+  sample.fraction = c(.5, .63,  0.7, .8),                       
+  rmse = NA 
+)
+
+sapply(hyper_grid, length ) %>% prod()
+# execute full cartesian grid search
+for(i in seq_len(nrow(hyper_grid))) {
+  # fit model for ith hyperparameter combination
+  fit <- ranger(
+    formula         = label ~ ., 
+    data            = train_prot_all, 
+    num.trees       = n_features * 10,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$min.node.size[i],
+    replace         = hyper_grid$replace[i],
+    sample.fraction = hyper_grid$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 123,
+    respect.unordered.factors = 'ignore',
+  )
+  # export OOB error 
+  hyper_grid$rmse[i] <- sqrt(fit$prediction.error)
+}
+
+# assess top 10 models
+hyper_grid %>%
+  arrange(rmse) %>%
+  mutate(perc_gain = (default_rmse - rmse) / default_rmse * 100) %>%
+  head(20)
+```
+
+
+
+
+
+```{r}
+library(h2o)
+h2o.no_progress()
+h2o.init(max_mem_size = "8g")
+```
+
+```{r}
+# convert training data to h2o object
+train_h2o <- as.h2o(train_prot_all)
+
+# set the response column to label
+response <- "label"
+
+# set the predictor names
+predictors <- setdiff(colnames(train_prot_all), response)
+```
+
+
+```{r}
+h2o_rf1 <- h2o.randomForest(
+    x = predictors, 
+    y = response,
+    training_frame = train_h2o, 
+    ntrees = n_features * 10,
+    seed = 123
+)
+
+h2o_rf1
+
+```
+
+```{r}
+# hyperparameter grid
+hyper_grid <- list(
+  mtries = floor(n_features * c(0.25, .05,0.075, 0.1, .15, 0.2 ,.25, .333, .4)),
+  min_rows = c(1, 3, 5, 10),
+  max_depth = c(1, 5,10, 20, 30),
+  sample_rate = c( .632, .70, .80)
+)
+
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "auc",
+  stopping_tolerance = 0.001,   # stop if improvement is < 0.1%
+  stopping_rounds = 10,         # over the last 10 models
+  max_runtime_secs = 60*5      # or stop search after 5 min.
+)
+```
+
+
+```{r}
+# perform grid search 
+random_grid <- h2o.grid(
+  algorithm = "randomForest",
+  grid_id = "hyper_grid",
+  x = predictors, 
+  y = response, 
+  training_frame = train_h2o,
+  hyper_params = hyper_grid,
+  ntrees = n_features * 10,
+  seed = 123,
+  stopping_metric = "auc",   
+  stopping_rounds = 10,           # stop if last 10 trees added 
+  stopping_tolerance = 0.005,     # don't improve RMSE by 0.5%
+  search_criteria = search_criteria
+)
+```
+
+
+```{r}
+# collect the results and sort by our model performance metric 
+# of choice
+random_grid_perf <- h2o.getGrid(
+  grid_id = "hyper_grid", 
+  sort_by = "auc", 
+  decreasing = TRUE
+)
+random_grid_perf 
+```
+
+
+```{r}
+library(ranger)
+# re-run model with impurity-based variable importance
+rf_impurity <- ranger(
+  formula = label ~ ., 
+  data = train_prot_all, 
+  num.trees = 40,
+  mtry = 17,
+  min.node.size = 1,
+  sample.fraction = .7,
+  replace = FALSE,
+  importance = "impurity",
+  respect.unordered.factors = "ignore",
+  verbose = FALSE,
+  seed  = 123
+)
+
+# re-run model with permutation-based variable importance
+rf_permutation <- ranger(
+  formula = label ~ ., 
+  data = train_prot_all, 
+  num.trees = 40,
+  mtry = 17,
+  min.node.size = 1,
+  sample.fraction = 0.7,
+  replace = FALSE,
+  importance = "permutation",
+  respect.unordered.factors = "ignore",
+  verbose = FALSE,
+  seed  = 123
+)
+```
+
+
+```{r}
+rf_impurity
+```
+
+
+```{r}
+p1 <- vip::vip(rf_impurity, num_features = 25, bar = FALSE)
+p2 <- vip::vip(rf_permutation, num_features = 25, bar = FALSE)
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+
+
+```{r}
+explainer_ranger <- explain(rf_impurity, data = train_prot_all[, -1], (as.numeric(train_prot_all$label)) - 1)
+```
+
+```{r}
+# Compute predictions
+pred1 <- predict(rf_impurity, test_prot_all[, -1]) %>% as.vector()
+
+pred2 <- predict(rf_permutation, test_prot_all[, -1]) %>% as.vector()
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+qplot(pred1$predictions) + theme_minimal()
+```
+
+```{r}
+# Review AUC - Area Under Curve
+# 
+# prediction3 <- as.numeric(pred1$predictions > 0.5)
+# prediction4 <- as.numeric(pred2$predictions > 0.5)
+confusionMatrix(pred1$predictions,test_prot_all$label)
+confusionMatrix(pred2$predictions, test_prot_all$label)
+
+```
+
+
+```{r}
+plot(pROC::roc(response = test_prot_all$label,
+               predictor = as.numeric(pred2$predictions),
+               levels=c(0, 1)),  lwd=2) 
+```
+
+
+
+## Feature selection
+```{r}
+library(SuperLearner)
+library("arm")
+set.seed(123)
+# Fit the SuperLearner.
+# We need to use list() instead of c().
+SL.library <- c("SL.ranger", "SL.xgboost", "SL.svm" )
+cv_sl = SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        #cvControl = list(V = 10),
+                        #parallel = "multicore",
+                        #method = "AUC",
+                        #SL.library =  list("SL.randomForest",  c("SL.randomForest", "screen.corP"
+                        SL.library =  SL.library)
+```
+
+
+```{r}
+cv_sl
+
+```
+
+```{r}
+preds <- predict.SuperLearner(cv_sl, test_prot_all[, -1])
+
+prediction <- as.numeric(preds$pred > 0.5)
+cm <- confusionMatrix(as.factor(prediction), as.factor(as.numeric(test_prot_all$label)-1))
+
+cm
+```
+```{r}
+set.seed(167)
+
+# Fit the SuperLearner.
+# We need to use list() instead of c().
+ SL.library <- list("SL.randomForest",  c("SL.randomForest", "screen.corP"), "SL.ranger", c("SL.ranger", "screen.corP"),"SL.xgboost", c("SL.xgboost", "screen.corP"), "SL.svm" ,  c("SL.svm", "screen.corP")) 
+
+cv_sl1 = CV.SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        cvControl = list(V = 10),
+                        parallel = "multicore", SL.library =  SL.library
+                        #list("SL.randomForest",  c("SL.randomForest", "screen.corP"
+)
+
+summary(cv_sl1)
+
+cv_sl2 = CV.SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        cvControl = list(V = 10),
+                        parallel = "multicore",
+                        method = "method.AUC",
+                        SL.library =   SL.library)
+
+"method.NNloglik"
+
+cv_sl3 = CV.SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        cvControl = list(V = 10),
+                        parallel = "multicore",
+                        method = "method.NNloglik",
+                        SL.library =   SL.library)
+```
+
+
+```{r}
+plot(cv_sl1)
+```
+```{r}
+summary(cv_sl2)
+```
+
+
+```{r}
+plot(cv_sl2)
+```
+
+```{r}
+summary(cv_sl3)
+```
+
+
+It turns out that *rnadomForrest* with *corP* and  and *ranger* with *corP* parameters perform rather well as the confidence intervals around errors are smaller.
+The *svm* with *corP* also performs well but with greater error. We will use ranger and svm for our analyses.
+
+## Model tuning
+
+To tune the model, we will use the create.learner function. 
+Parameters to optimise for ranger are 
+1) number of trees
+2) mtry 
+
+
+
+```{r}
+learner_1 <- create.Learner("SL.ranger", params = list(num.trees = 2000))
+SL.library <- list( c("SL.randomForest", "screen.corP"), "SL.ranger", c("SL.ranger", "screen.corP"), learner_1$names)
+cv_sl4 = CV.SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        V = 10,
+                        method = "method.AUC",
+                        SL.library = SL.library)
+summary(cv_sl4)
+```
+
+## Tune the *mtry* parameter.
+
+```{r}
+mtry_seq <-floor(sqrt(ncol(train_prot_all[ ,-1]))* c(0.15, 0.25, 0.5,0.7, 0.9, 1, 1.5, 2, 2.5, 3))
+learners = create.Learner("SL.ranger", tune = list(mtry = mtry_seq),params = list(num.trees = 2000))
+
+SL.library <- list(  learner_1$names)
+cv_sl5 = CV.SuperLearner(Y = as.numeric(train_prot_all$label)-1, X = as.data.frame(train_prot_all[ ,-1]), family = binomial(),
+                        V = 10,
+                        method = "method.AUC",
+                        SL.library = SL.library)
+summary(cv_sl5)
+```
+
+
+```{r}
+# Print the highest and lowest predicted sales price
+paste("Observation", which.max(predictions), 
+      "has a predicted sale price of", scales::dollar(max(predictions))) 
+## [1] "Observation 1825 has a predicted sale price of $663,136"
+paste("Observation", which.min(predictions), 
+      "has a predicted sale price of", scales::dollar(min(predictions)))  
+## [1] "Observation 139 has a predicted sale price of $47,245.45"
+
+# Grab feature values for observations with min/max predicted sales price
+high_ob <- as.data.frame(train_h2o)[which.max(predictions), ] %>% select(-Sale_Price)
+low_ob  <- as.data.frame(train_h2o)[which.min(predictions), ] %>% select(-Sale_Price)
+```
+
+
+## Support vector machine
+
+
+```{r}
+# preProcValues <- preProcess(train_prot$data, method = c("center", "scale"))
+# 
+# trainTransformed <- predict(preProcValues, train_prot$data)
+# preProcValues2 <- preProcess(test_prot$data, method = c("center", "scale"))
+# 
+# testTransformed <- predict(preProcValues2, test_prot$data)
+
+
+xgb_train = xgb.DMatrix(data = train_prot$data, label = train_prot$label)
+output_vector = train_prot$label == "1"
+xgb_test = xgb.DMatrix(data = test_prot$data, label = test_prot$label)
+```
+
+```{r}
+require(xgboost)
+require(Matrix)
+require(data.table)
+
+watchlist = list(train=xgb_train, test=xgb_test)
+
+#fit XGBoost model and display training and testing data at each round
+#model = xgb.train(data = xgb_train, max.depth = 3, watchlist=watchlist, nrounds = 70)
+
+final = xgboost(data = xgb_train, eta = 1, max.depth = 10, nrounds = 56, verbose = 0, objective = "binary:logistic", eval_metric = 'auc', prediction = T)
+```
+
+```{r}
+importance <- xgb.importance(feature_names = final$feature_names, model = final)
+head(importance)
+```
+
+```{r}
+xgb.plot.importance(importance_matrix = importance)
+
+```
+
+```{r}
+c2 <- cor(train_prot_all[,"Q13421"], output_vector, use = "complete.obs")
+print(c2)
+```
+
+```{r}
+pred <- predict(final, xgb_test)
+
+# size of the prediction vector
+print(length(pred))
+```
+
+```{r}
+print(head(pred))
+```
+
+```{r}
+prediction <- as.numeric(pred > 0.5)
+print(head(prediction))
+```
+
+```{r}
+library(pROC)
+```
+
+```{r}
+plot(pROC::roc(response = test_prot$label,
+               predictor = prediction,
+               levels=c(0, 1)),
+     lwd=1.5) 
+```
+
+```{r}
+err <- mean(as.numeric(pred > 0.5) != test_prot$label)
+print(paste("test-error=", err))
+```
+
+```{r}
+confusionMatrix(as.factor(prediction), as.factor(test_prot$label))
+```
+
+```{r}
+it = which.max(final$evaluation_log$test_auc_mean)
+best.iter = final$evaluation_log$iter[it]
+```
+
+```{r}
+#getwd()
+Sys.setenv(RETICULATE_PYTHON = "penv/bin/python")
+```
+
+```{python}
+import pandas as pd
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV, KFold
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+from xgboost import XGBClassifier
+```
+
+```{r}
+features_all <- assays(sumExpObj_overall)$batch_rm_l_raw_loess |> as.data.frame() |> rownames_to_column(var = "rowname")
+samples_data <- colData(sumExpObj_overall)  |> as.data.frame() |> rownames_to_column(var = "sampleID")
+
+```
+
+```{r}
+nzv <- nearZeroVar(features_all, saveMetrics= TRUE)
+descrCor <-  cor(t(assays(sumExpObj_overall)$batch_rm_l_raw_loess), use = "p")
+highCorr <- sum(abs(descrCor[upper.tri(descrCor)]) > .95)
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .9)
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .75)
+```
+
+```{python}
+features_all_py = r.features_all
+samples_data_py = r.samples_data
+```
+
+```{r}
+2^1.26
+```
+
+
+## References
+
+https://bradleyboehmke.github.io/HOML/

@@ -1,0 +1,167 @@
+---
+title: "Winter batch - Ovarian Cancer, case control analyses"
+author: "Ashfaq Ali"
+date: "2022-09-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r setup1, echo=FALSE ,include=FALSE}
+# import libraries and data
+#renv::init()
+library(tidyverse)
+library(reshape2)
+library(magrittr)
+library(readxl)
+library(fuzzyjoin)
+library(Hmisc)
+library(limma)
+library(DBI)
+library(VIM)
+library(factoextra)
+library(FactoMineR)
+library(mice)
+library(SummarizedExperiment)
+#renv::install("stemangiola/tidySummarizedExperiment")
+library(xlsx)
+#library(tidySummarizedExperiment)
+
+library(RColorBrewer)
+library(GGally)
+library(ggiraphExtra)
+library(knitr)
+library(kableExtra)
+library(plotly)
+library(RankAggreg)
+library(DT)
+library(ggVennDiagram)
+getwd()
+
+source("./code/functions.R")
+```
+
+# Re-analyses with case control categories
+
+```{r}
+sumExpObj_overall <- readRDS( "./data/rawdata/sumExpObj_overall_wnt_filt.rds")
+
+```
+
+## Filter and prune outcome variable
+
+Samples corresponding the "other" category were removed along with the samples with NA values in the outcome variable.
+
+Based on the meeting with Karin in Spring, the outcome variable corresponding to tumor type were pruned as following.
+
+For 0,1,2 coding, 1 and 2 were converted into one level.
+
+For tumor type variable, "B" and "H" categories were not combined to form "Control" group while "BL" and "M" were combined to make the "case" category.
+
+
+```{r}
+sumExpObj_overall <- readRDS( "./data/rawdata/sumExpObj_overall_wnt_filt.rds")
+
+sumExpObj_winter_overall_filt <- sumExpObj_overall[, !is.na(sumExpObj_overall$Type_1_2) | !is.na(sumExpObj_overall$tumor_type) ]
+sumExpObj_winter_overall_filt$tumor_type[grep("Other", sumExpObj_winter_overall_filt$tumor_type)] <- "Other"
+sumExpObj_winter_overall_filt <- sumExpObj_winter_overall_filt[ , which(sumExpObj_winter_overall_filt$tumor_type!="Other") ]
+
+sumExpObj_winter_overall_filt$tumor_type_new <- case_when(
+sumExpObj_winter_overall_filt$tumor_type =="B" |  sumExpObj_winter_overall_filt$tumor_type == "H" ~ "control",
+  sumExpObj_winter_overall_filt$tumor_type =="BL" |  sumExpObj_winter_overall_filt$tumor_type == "M" ~ "case"
+                                     
+                                        )
+
+
+sumExpObj_winter_overall_filt$tumor_type_new <- as.factor(sumExpObj_winter_overall_filt$tumor_type_new) |> relevel(ref = "control")
+
+sumExpObj_winter_overall_filt$Type_1_2_new <- case_when(
+sumExpObj_winter_overall_filt$Type_1_2 ==0 ~ "One",
+  sumExpObj_winter_overall_filt$Type_1_2 ==1 |  sumExpObj_winter_overall_filt$Type_1_2 == 2 ~ "Two"
+                                     
+                                        )
+
+sumExpObj_winter_overall_filt$Type_1_2_new  <- as.factor(sumExpObj_winter_overall_filt$Type_1_2_new ) |> relevel(ref = "One")
+
+
+saveRDS(sumExpObj_winter_overall_filt, "./data/rawdata/data_sumExpfil_wntr_new_vars.rds")
+
+```
+
+
+
+## Statistical ananlyses: Overall data set for Loess Normalized data
+
+### type
+
+```{r}
+
+#design_t12 <- model.matrix(~ 0 + Type_1_2, data = colData(sumExpObj_summer_overall_filt))
+
+design_tt <- model.matrix(~ 0 + tumor_type_new, data = colData(sumExpObj_winter_overall_filt))
+
+name <- levels(sumExpObj_winter_overall_filt$tumor_type_new)
+colnames(design_tt) <- name
+
+fit_tt <- lmFit((assays(sumExpObj_winter_overall_filt)$batch_rm_l_raw_loess), design = design_tt)
+contrast.matrix <- makeContrasts(case-control, levels=name)
+fit_tt <- contrasts.fit(fit_tt, contrast.matrix)
+fit_tt <- eBayes(fit = fit_tt)
+
+
+Results_overall_wntr <- list()
+
+Results_overall_wntr$case_vs_control <- topTable(fit_tt, p.value = 1, number = Inf, coef = "case - control", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_winter_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    by = "Protein.Group"
+  ) 
+
+
+
+```
+
+### Tumor type variable
+
+```{r}
+design_tt2 <- model.matrix(~ 0 + Type_1_2_new, data = colData(sumExpObj_winter_overall_filt))
+
+name <- levels(sumExpObj_winter_overall_filt$Type_1_2_new)
+#name <- c("zero", "one", "two")
+colnames(design_tt2) <- name
+
+fit_12 <- lmFit((assays(sumExpObj_winter_overall_filt)$batch_rm_l_raw_loess), design = design_tt2)
+contrast.matrix <- makeContrasts(Two-One, levels=name)
+fit_12 <- contrasts.fit(fit_12, contrast.matrix)
+fit_12 <- eBayes(fit = fit_12)
+
+
+#Results_overall <- list()
+
+Results_overall_wntr$type_two_vs_on <- topTable(fit_12, p.value = 1, number = Inf, coef = "Two - One", confint = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column(., var = "Protein.Group") %>%
+ # arrange(padj) %>%
+  left_join(rowData(sumExpObj_summer_overall_filt) |> as_tibble(),
+    {
+      .
+    },
+    
+    by ="Protein.Group"
+  )
+```
+
+
+```{r}
+writexl::write_xlsx(Results_overall_wntr, "./results_wnt/DE_results_winter.xlsx")
+
+```
+
